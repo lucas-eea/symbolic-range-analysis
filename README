@@ -1,0 +1,10 @@
+```bash
+mkdir build
+cd build
+cmake -G Ninja ..
+ninja
+opt -load-pass-plugin=SymbolicRanges.so \
+    -passes="sra-annotator" \
+    -disable-output \
+    ../tests/test.ll
+
