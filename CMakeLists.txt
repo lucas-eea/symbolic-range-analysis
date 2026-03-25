@@ -11,6 +11,10 @@ include(AddLLVM)
 
 include_directories(include)
 
+add_llvm_pass_plugin(ESSAfier
+  lib/ESSAfier.cpp
+)
+
 add_llvm_pass_plugin(SymbolicRanges
   lib/SymbolicRangeAnalysis.cpp
 )
