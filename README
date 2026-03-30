@@ -1,10 +1,18 @@
+# Symbolic Range Analysis
+
+## Build
 ```bash
-mkdir build
-cd build
+mkdir build && cd build
 cmake -G Ninja ..
 ninja
-opt -load-pass-plugin=SymbolicRanges.so \
-    -passes="sra-annotator" \
-    -disable-output \
-    ../tests/test.ll
+```
 
+## Running the ESSAfier Pass
+```bash
+opt -load-pass-plugin=build/ESSAfier.so -passes="mem2reg,ESSAfier" -S tests/input.ll -o tests/output.ll
+```
+
+## Running the Symbolic Range Analysis
+```bash
+opt -load-pass-plugin=SymbolicRanges.so -passes="sra-annotator" -disable-output ../tests/test.ll
+``` 
