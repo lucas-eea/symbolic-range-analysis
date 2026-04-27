@@ -18,6 +18,7 @@ add_llvm_pass_plugin(ESSAfier
 
 add_llvm_pass_plugin(SymbolicRanges
   lib/SymbolicRangeAnalysis.cpp
+  lib/GiNaCGlue.cpp
 )
 
 add_executable(symboxes
@@ -37,3 +38,4 @@ execute_process(
 )
 
 target_link_libraries(symboxes PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} ginac cln)
+target_link_libraries(SymbolicRanges PRIVATE ginac cln)
