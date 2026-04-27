@@ -16,7 +16,6 @@ This yields two LLVM pass plugins inside `build/`:
 - `ESSAfier.so` — converts LLVM IR to Extended SSA form (E-SSA), plus inserts σ-nodes at branch targets.
 - `SymbolicRanges.so` — runs the symbolic range analysis on E-SSA form IR.
 
-Also, the binaries for tests/
 ## Usage
 
 ### Step 0 - Compile C to LLVM IR
