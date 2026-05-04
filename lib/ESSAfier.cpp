@@ -24,13 +24,21 @@ void insertPHIs(Value* LHS, Value* RHS, BasicBlock* Branch,
 					1,
 					LHS->getName() + Suffix,
 					Branch->begin());
-  SigmaLHS->addIncoming(LHS, BB);
   PHINode *SigmaRHS = PHINode::Create(RHS->getType(),
 					1,
 					RHS->getName() + Suffix,
 					Branch->begin());
+  SigmaLHS->addIncoming(LHS, BB);
   SigmaRHS->addIncoming(RHS, BB);
 
+  LLVMContext &CtxLHS = SigmaLHS->getContext();
+  LLVMContext &CtxRHS = SigmaRHS->getContext();
+  Metadata *MDLHS[] = {MDString::get(CtxLHS, Suffix)};
+  Metadata *MDRHS[] = {MDString::get(CtxRHS, Suffix)};
+  SigmaLHS->setMetadata("sigma", MDNode::get(CtxLHS, {MDLHS}));
+  SigmaRHS->setMetadata("sigma", MDNode::get(CtxRHS, {MDRHS}));
+  
+  
   for (Instruction &I : *Branch){
     if (isa<PHINode>(&I)) continue;
     for (Use &U : I.operands()){
