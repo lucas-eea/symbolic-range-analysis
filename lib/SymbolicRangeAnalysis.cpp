@@ -23,6 +23,9 @@ static symboxes::SymRange getState(Value *V,
     if (It != St.end())
         return It->second;
 
+    if (auto *Arg = dyn_cast<Argument>(V))
+      return symboxes::SymRange::single(symboxes::SymExpr::sym(Arg));
+    
     return symboxes::SymRange::bottom();
 }
 
@@ -74,24 +77,44 @@ symboxes::SymRange applyConstraint(symboxes::SymRange R,
 
     auto Ra = getState(A, St);
     auto Rb = getState(B, St);
-
+    
     switch (Cmp->getPredicate()) {
+    case ICmpInst::ICMP_SGE:
+      isTrueSide = !isTrueSide;
+      [[fallthrough]];
     case ICmpInst::ICMP_SLT:
-        if (isTrueSide)
-            return isA
-                ? symboxes::SymRange::of(Ra.Lower,
-                      SE::mkMin(SE::sub(Rb.Upper, SE::num(1)), Ra.Upper))
-                : symboxes::SymRange::of(
-                      SE::mkMax(SE::add(Ra.Lower, SE::num(1)), Rb.Lower),
+      if (isTrueSide)
+	  return isA
+	      ? symboxes::SymRange::of(Ra.Lower,
+					 SE::mkMin(SE::sub(Rb.Upper, SE::num(1)), Ra.Upper))
+	      : symboxes::SymRange::of(
+					 SE::mkMax(SE::add(Ra.Lower, SE::num(1)), Rb.Lower),
                       Rb.Upper);
         else
-            return isA
-                ? symboxes::SymRange::of(SE::mkMax(Ra.Lower, Rb.Lower), Ra.Upper)
-                : symboxes::SymRange::of(Rb.Lower, SE::mkMin(Ra.Upper, Rb.Upper));
+	  return isA
+	      ? symboxes::SymRange::of(SE::mkMax(Ra.Lower, Rb.Lower), Ra.Upper)
+	      : symboxes::SymRange::of(Rb.Lower, SE::mkMin(Ra.Upper, Rb.Upper));
+	
+    case ICmpInst::ICMP_SLE:
+      isTrueSide = !isTrueSide;
+      [[fallthrough]];
+    case ICmpInst::ICMP_SGT:
+      if (isTrueSide)
+	return isA
+	  ? symboxes::SymRange::of(SE::mkMax(Ra.Lower, SE::add(Rb.Lower, SE::num(1))),
+				 Ra.Upper)
+      : symboxes::SymRange::of(Rb.Lower,
+			         SE::mkMin(SE::sub(Ra.Upper, SE::num(1)), Rb.Upper));
+      else
+	return isA
+	  ? symboxes::SymRange::of(Ra.Lower,
+				   SE::mkMin(Ra.Upper, Rb.Upper))
+      : symboxes::SymRange::of(SE::mkMax(Rb.Lower, Ra.Lower),Rb.Upper);
     default:
-        return R;
+      return R;
     }
 }
+
 static symboxes::SymRange transfer(Instruction &I,
                                    DenseMap<Value *, symboxes::SymRange> &St)
 {
