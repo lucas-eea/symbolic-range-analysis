@@ -148,18 +148,8 @@ if.end:
 ```
 ### Running both passes together
 
-You'll need two `opt` invocations for that:
-
 ```bash
-opt -load-pass-plugin=build/ESSAfier.so \
-    --passes="mem2reg,ESSAfier" \
-    -S tests/input.ll \
-    -o tests/essa.ll
-
-opt -load-pass-plugin=build/SymbolicRanges.so \
-    --passes="sra-annotator" \
-    --disable-output \
-    tests/essa.ll
+opt -load-pass-plugin=./build/ESSAfier.so     -load-pass-plugin=./build/SymbolicRanges.so     -passes="function(ESSAfier),sra-annotator"     -disable-output tests/beforeESSAfier.ll:w
 ```
 
 ### Running the unit tests
