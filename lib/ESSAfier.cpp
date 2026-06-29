@@ -5,12 +5,13 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/DominanceFrontier.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Plugins/PassPlugin.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
 #include <map>
+#include <set>
 
 using namespace llvm;
 
