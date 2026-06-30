@@ -4,6 +4,11 @@ Implementation of the symbolic range analysis described in:
 
 > Nazaré et al. [*Validation of Memory Accesses Through Symbolic Analyses*](https://homepages.dcc.ufmg.br/~fernando/publications/papers/OOPSLA14.pdf), OOPSLA 2014.
 
+## Prerequisites
+
+- [LLVM](https://llvm.org/)
+- [GiNaC](https://www.ginac.de/) — required for the symbolic range analysis pass
+
 ## Build
 ```bash
 # If llvm-config is on your PATH, no extra configuration is needed.
