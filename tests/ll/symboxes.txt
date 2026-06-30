@@ -1,0 +1,66 @@
+; Checks for the standalone SymBoxes unit test (build/symboxes).
+
+; CHECK: === SymExpr: constants ===
+; CHECK: 0 == 0: true
+; CHECK: 0 == 1: false
+; CHECK: 0 + 5 == 5: true
+; CHECK: 5 + 0 == 5: true
+; CHECK: 5 - 0 == 5: true
+; CHECK: 5 - 5 == 0: true
+; CHECK: 0 * 5 == 0: true
+; CHECK: 1 * 5 == 5: true
+; CHECK: 5 / 1 == 5: true
+; CHECK: 5 / 0 == 0: true
+
+; CHECK: === SymExpr: infinity ===
+; CHECK: +∞ + 1 == +∞: true
+; CHECK: -∞ - 1 == -∞: true
+; CHECK: +∞ / -1 == -∞: true
+; CHECK: -∞ / -1 == +∞: true
+
+; CHECK: === SymExpr: equality ===
+; CHECK: v == v: true
+; CHECK: v == s: false
+; CHECK: v+s == s+v: true
+; CHECK: v+s == v+v: false
+; CHECK: v*s == s*v: true
+; CHECK: (v+s)-s == v: true
+
+; CHECK: === SymExpr: distributivity ===
+; CHECK: (a+b)*c == a*c+b*c: true
+; CHECK: (a-b)*c == a*c-b*c: true
+
+; CHECK: === SymExpr: print ===
+; CHECK: x+1 prints as: (x + 1)
+; CHECK: +∞ prints as: +∞
+; CHECK: -∞ prints as: -∞
+
+; CHECK: === SymRange: basic ===
+; CHECK: [0,10] prints as: [0, 10]
+; CHECK: ∅ prints as: ∅
+; CHECK: full prints as: [-∞, +∞]
+; CHECK: [0,10] == [0,10]: true
+; CHECK: ∅ == ∅: true
+; CHECK: [0,10] == ∅: false
+
+; CHECK: === SymRange: join ===
+; CHECK: [0,5] ⊔ [1,10] = [0, 10]
+; CHECK: ∅ ⊔ [0,5] = [0, 5]
+; CHECK: [0,5] ⊔ ∅ = [0, 5]
+; CHECK: [0,10] ⊔ [-∞,+∞] = [-∞, +∞]
+; CHECK: [-∞,+∞] ⊔ [0,10] = [-∞, +∞]
+; CHECK: ∅ ⊔ ∅ = ∅
+
+; CHECK: === SymRange: widen ===
+; CHECK: [0,5] ∇ [0,10] = [0, +∞]
+; CHECK: [1,5] ∇ [0,5] = [-∞, 5]
+; CHECK: [0,5] ∇ [1,10] = [-∞, +∞]
+; CHECK: [0,5] ∇ [0,5] = [0, 5]
+; CHECK: ∅ ∇ [0,5] = [0, 5]
+; CHECK: [0,5] ∇ ∅ = [0, 5]
+
+; CHECK: === SymRange: symbolic bounds ===
+; CHECK: [0,N] prints as: [0, N]
+; CHECK: [0,N+1] prints as: [0, (N + 1)]
+; CHECK: [0,N] == [0,N]: true
+; CHECK: [0,N] == [0,N+1]: false
