@@ -5,16 +5,12 @@ Implementation of the symbolic range analysis described in:
 > Nazaré et al. [*Validation of Memory Accesses Through Symbolic Analyses*](https://homepages.dcc.ufmg.br/~fernando/publications/papers/OOPSLA14.pdf), OOPSLA 2014.
 
 ## Build
-
 ```bash
-mkdir build && cd build
-cmake -G Ninja ..
-ninja
+# If llvm-config is on your PATH, no extra configuration is needed.
+# Otherwise, point LLVM_DIR at your installation's CMake configuration directory:
+# export LLVM_DIR=/usr/lib/llvm-17/lib/cmake/llvm
+scripts/build.sh
 ```
-
-This yields two LLVM pass plugins inside `build/`:
-- `ESSAfier.so` — converts LLVM IR to Extended SSA form (E-SSA), plus inserts σ-nodes at branch targets.
-- `SymbolicRanges.so` — runs the symbolic range analysis on E-SSA form IR.
 
 ## Usage
 
@@ -25,7 +21,7 @@ This yields two LLVM pass plugins inside `build/`:
 
 ### Step 1 — Convert to E-SSA form
 
-Run `mem2reg` first to promote allocas to SSA registers, then apply the ESSAfier pass to insert σ-nodes:
+Run `mem2reg` first to promote allocas to SSA registers, then apply the ESSAfier pass:
 
 ```bash
 opt -load-pass-plugin=build/ESSAfier.so \
@@ -33,129 +29,109 @@ opt -load-pass-plugin=build/ESSAfier.so \
     -S tests/input.ll \
     -o tests/output.ll
 ```
-
-The output file `tests/output.ll` is the E-SSA form of the input, with renamed variables (`.t`/`.f` suffixes) at branch targets.
 #### Expected Results
-##### Input
-```llvm
-define dso_local i32 @src(i32 noundef %a, i32 noundef %b) #0 {
-entry:
-  %add = add nsw i32 %b, 1
-  %sub = sub nsw i32 %add, 8
-  %cmp = icmp slt i32 %a, %b
-  br i1 %cmp, label %if.then, label %if.else
+The output file `tests/output.ll` is the E-SSA form of the input, which adds σ-nodes, i.e: copies of variables at conditionals with renamed variables (`.t`/`.f` suffixes) at branch targets.
+Additionally, the pass also places copies of variables which  depend transitively on the variables at conditionals and that are used in a label dominated by the branch target.
 
-if.then:                                          ; preds = %entry
-  %add1 = add nsw i32 10, %a
-  br label %if.end
-
-if.else:                                          ; preds = %entry
-  %add2 = add nsw i32 -10, %sub
-  br label %if.end
-
-if.end:                                           ; preds = %if.else, %if.then
-  %p.0 = phi i32 [ %add1, %if.then ], [ %add2, %if.else ]
-  %add3 = add nsw i32 %p.0, 100
-  ret i32 %add3
-}
-```
-##### Output
-```llvm
-define dso_local i32 @tgt(i32 noundef %a, i32 noundef %b) #0 {
-entry:
-  %add = add nsw i32 %b, 1
-  %sub = sub nsw i32 %add, 8
-  %cmp = icmp slt i32 %a, %b
-  br i1 %cmp, label %if.then, label %if.else
-
-if.then:                                          ; preds = %entry
-  %b.t = phi i32 [ %b, %entry ]
-  %a.t = phi i32 [ %a, %entry ]
-  %add1 = add nsw i32 10, %a.t
-  br label %if.end
-
-if.else:                                          ; preds = %entry
-  %b.f = phi i32 [ %b, %entry ]
-  %a.f = phi i32 [ %a, %entry ]
-  %add.f = add nsw i32 %b.f, 1
-  %sub.f = sub nsw i32 %add.f, 8
-  %add2 = add nsw i32 -10, %sub.f
-  br label %if.end
-
-if.end:                                           ; preds = %if.else, %if.then
-  %p.0 = phi i32 [ %add1, %if.then ], [ %add2, %if.else ]
-  %add3 = add nsw i32 %p.0, 100
-  ret i32 %add3
+For instance, see this C Program:
+```c
+// tests/c/transitive_dependences_handling.c
+int test(int a, int b) {
+    int x = a + 1;   // x transitively depends on a (directly)
+    int y = x * 2;   // y transitively depends on a through x
+    if (a < b) {
+        int p = y + 1;
+        return p;    // y is consumed here → copies of x and y appear in if.then
+    }
+    return 0;        // false branch never touches y → no copies for dependences there
 }
 ```
 
-**(WIP)**
+After ESSAfier, the true branch becomes:
+
+```llvm
+if.then:
+  %b.t   = phi i32 [ %b, %entry ], !sigma !...
+  %a.t   = phi i32 [ %a, %entry ], !sigma !...
+  %add.t = add nsw i32 %a.t, 1        ; copy of x = a+1, rewritten to use a.t
+  %mul.t = mul nsw i32 %add.t, 2      ; copy of y = x*2, rewritten to use add.t
+  %add1  = add nsw i32 %mul.t, 1      ; original p = y+1, rewritten to use mul.t
+  br label %if.end
+if.end:                                ; false branch: σ-nodes only, no copies
+  %b.f = phi i32 [ %b, %entry ], !sigma !...
+  %a.f = phi i32 [ %a, %entry ], !sigma !...
+  br label %return
+```
+
+This is useful because we can be more precise about the ranges of the .t or .f copies.
+
 ### Step 2 — Run Symbolic Range Analysis
 
-Feed the E-SSA IR into the range analysis pass:
+Feed the E-SSA IR into the range-analysis annotator pass. It annotates every instruction that has a non-trivial symbolic range with `!srange` metadata:
 
 ```bash
-opt -load-pass-plugin=build/SymbolicRanges.so \
-    -passes="sra-annotator" \
-    -disable-output \
-    tests/output.ll
+opt -load-pass-plugin=./build/ESSAfier.so \
+    -load-pass-plugin=./build/SymbolicRanges.so \
+    -passes="function(ESSAfier),sra-annotator" \
+    -S input.ll -o annotated.ll
 ```
-
-The pass prints each variable's symbolic range to stderr in the form `[lower, upper]`.
-
 #### Expected Results
-For the same input as step one, this output is expected:
-```
-entry:
-    %add = add nsw i32 %b, 1
-    => [(b + 1), (b + 1)]
-    %sub = sub nsw i32 %add, 8
-    => [((b + 1) - 8), ((b + 1) - 8)]
-    %cmp = icmp slt i32 %a, %b
-    => [-∞, +∞]
-    br i1 %cmp, label %if.then, label %if.else
-    => [-∞, +∞]
-if.then:
-    %b.t = phi i32 [ %b, %entry ], !sigma !3
-    => [max((a + 1), b), b]
-    %a.t = phi i32 [ %a, %entry ], !sigma !3
-    => [a, min((b - 1), a)]
-    %add1 = add nsw i32 10, %a.t
-    => [(10 + a), (10 + min((b - 1), a))]
-    br label %if.end
-    => [-∞, +∞]
-if.else:
-    %b.f = phi i32 [ %b, %entry ], !sigma !4
-    => [b, min(a, b)]
-    %a.f = phi i32 [ %a, %entry ], !sigma !4
-    => [max(a, b), a]
-    %add.f = add nsw i32 %b.f, 1
-    => [(b + 1), (min(a, b) + 1)]
-    %sub.f = sub nsw i32 %add.f, 8
-    => [((b + 1) - 8), ((min(a, b) + 1) - 8)]
-    %add2 = add nsw i32 -10, %sub.f
-    => [(-10 + ((b + 1) - 8)), (-10 + ((min(a, b) + 1) - 8))]
-    br label %if.end
-    => [-∞, +∞]
-if.end:
-    %p.0 = phi i32 [ %add1, %if.then ], [ %add2, %if.else ]
-    => [min((10 + a), (-10 + ((b + 1) - 8))), max((10 + min((b - 1), a)), (-10 + ((min(a, b) + 1) - 8)))]
-    %add3 = add nsw i32 %p.0, 100
-    => [(min((10 + a), (-10 + ((b + 1) - 8))) + 100), (max((10 + min((b - 1), a)), (-10 + ((min(a, b) + 1) - 8))) + 100)]
-    ret i32 %add3
-    => [-∞, +∞]
+This Pass annotates instructions with `!srange !N` metadata, where `!N` is a two-operand `MDNode`:
 
+```llvm
+!N = !{!"<lower>", !"<upper>"}
 ```
+
+Both operands are `MDString` values serialized by GiNaC in its canonical polynomial form — e.g. `b+1` is printed as `"1+b"`.
+
+**Example** — `tests/c/symbolic_range_analysis_fig7.c` with `x ∈ [0, 15]`:
+
+```c
+int fig7(int b, int x) {
+    int a = 42;
+    int c = b + 1;          // range: [b+1, b+1]
+    int v = c - x;          // range: [(b+1)−15, (b+1)−0] = [b−14, b+1]
+    if (a < b) { return v; }
+    return v;
+}
+```
+
+```bash
+clang -O0 -S -emit-llvm -Xclang -disable-O0-optnone \
+    -fno-discard-value-names tests/c/symbolic_range_analysis_fig7.c -o - | \
+opt -passes=mem2reg -S | \
+opt -load-pass-plugin=./build/ESSAfier.so \
+    -load-pass-plugin=./build/SymbolicRanges.so \
+    -passes="function(ESSAfier),sra-annotator<x=0:15>" \
+    -S -o annotated.ll
+```
+
+Relevant annotations in `annotated.ll`:
+
+```llvm
+%add = add nsw i32 %b, 1,       !srange !C
+%sub = sub nsw i32 %add, %x,    !srange !V
+...
+!C = !{!"1+b",   !"1+b"}     ; encodes [b+1, b+1]
+!V = !{!"-14+b", !"1+b"}     ; encodes [b−14, b+1]
+```
+
+The `sra-annotator` pass also accepts per-argument concrete ranges as `sra-annotator<arg=lo:hi,...>` — used above to supply `x ∈ [0, 15]`.
+
 ### Running both passes together
 
 ```bash
-opt -load-pass-plugin=./build/ESSAfier.so     -load-pass-plugin=./build/SymbolicRanges.so     -passes="function(ESSAfier),sra-annotator"     -disable-output tests/beforeESSAfier.ll:w
+opt -load-pass-plugin=./build/ESSAfier.so \
+    -load-pass-plugin=./build/SymbolicRanges.so \
+    -passes="function(ESSAfier),sra-annotator" \
+    -S input.ll -o annotated.ll
 ```
 
-### Running the unit tests
-
-This runs the `SymBoxes` lattice tests for the semi-lattice operations: join, widening, and symbolic equality.
-
+### Running Tests
+You can run all tests using:
 ```bash
-build/symboxes
+scripts/run_tests.sh
 ```
+
+This compiles each test in `tests/c/`, runs ESSAfier and/or SRA, and checks the output against the LLVM `FileCheck` patterns in `tests/ll/`.
+It also runs the `SymBoxes` lattice tests for the semi-lattice operations: join, widening, and symbolic equality.
