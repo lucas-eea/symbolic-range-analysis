@@ -38,3 +38,9 @@ tramp
 Thumbs.db
 vgcore.*
 core
+
+# Test check files are IR-like but must be tracked.
+!tests/ll/*.ll
+!tests/ir/*.ll
+!tests/sra-ir/*.ll
+build-*/
