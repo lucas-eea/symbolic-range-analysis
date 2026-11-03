@@ -1,58 +1,81 @@
 //===- ESSAfier.cpp - Extended-SSA form pass ------------------------------===//
+//
+/// \file
+/// Implements the ESSAfier pass and registers it as `ESSAfier`.
+//
+//===----------------------------------------------------------------------===//
 
 #include "ESSAfier.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
 #include <map>
 #include <set>
 
 using namespace llvm;
 
-/// Inserts the phi nodes that represent sigma nodes
-/// with correct metadata.
-static void insertPHIs(Value *LHS, Value *RHS, BasicBlock *Branch,
-                       BasicBlock *BB, StringRef Suffix) {
-  if (!Branch->getSinglePredecessor())
-    return;
+static cl::opt<bool> SplitCriticalEdges(
+    "essa-split-critical-edges", cl::init(true),
+    cl::desc("Split critical edges out of conditional branches, so that every "
+             "branch target can receive sigma nodes"));
 
-  PHINode *SigmaLHS = PHINode::Create(LHS->getType(), 1,
-                                      LHS->getName() + Suffix,
-                                      Branch->begin());
-  PHINode *SigmaRHS = PHINode::Create(RHS->getType(), 1,
-                                      RHS->getName() + Suffix,
-                                      Branch->begin());
-  SigmaLHS->addIncoming(LHS, BB);
-  SigmaRHS->addIncoming(RHS, BB);
+/// Returns true if live ranges can be split along the edge \p BB -> \p
+/// Target, that is, if that edge is the only way into \p Target.
+static bool canSplitInto(BasicBlock *Target, BasicBlock *BB) {
+  return Target != BB && Target->getSinglePredecessor() == BB;
+}
 
-  LLVMContext &Ctx = SigmaLHS->getContext();
-  Metadata *MDLHS[] = {MDString::get(Ctx, Suffix)};
-  Metadata *MDRHS[] = {MDString::get(Ctx, Suffix)};
-  SigmaLHS->setMetadata("sigma", MDNode::get(Ctx, MDLHS));
-  SigmaRHS->setMetadata("sigma", MDNode::get(Ctx, MDRHS));
+/// Returns true if \p V may be renamed. Only integer values are renamed:
+/// constants have the same value everywhere, and renaming pointers would
+/// break intrinsics that need the original value, such as
+/// llvm.lifetime.start.
+static bool isRedefinable(Value *V) {
+  return !isa<Constant>(V) && V->getType()->isIntegerTy();
+}
 
-  for (Instruction &I : *Branch) {
-    if (isa<PHINode>(I))
-      continue;
-    for (Use &U : I.operands()) {
-      if (U.get() == LHS)
-        U.set(SigmaLHS);
-      if (U.get() == RHS)
-        U.set(SigmaRHS);
+/// Inserts a sigma node for each of \p Roots at the top of \p Branch, tagged
+/// with !sigma \p Suffix, and renames every use of a root dominated by \p
+/// Branch. A use in a phi node counts at the end of its incoming block.
+static void insertPHIs(ArrayRef<Value *> Roots, BasicBlock *Branch,
+                       BasicBlock *BB, StringRef Suffix, DominatorTree &DT) {
+  LLVMContext &Ctx = Branch->getContext();
+  MDNode *MD = MDNode::get(Ctx, {MDString::get(Ctx, Suffix)});
+  for (Value *Root : Roots) {
+    PHINode *Sigma = PHINode::Create(Root->getType(), 1,
+                                     Root->getName() + Suffix, Branch->begin());
+    Sigma->addIncoming(Root, BB);
+    Sigma->setMetadata("sigma", MD);
+    for (Use &U : make_early_inc_range(Root->uses())) {
+      auto *UI = dyn_cast<Instruction>(U.getUser());
+      if (!UI || UI == Sigma)
+        continue;
+      BasicBlock *UseBB = UI->getParent();
+      if (auto *Phi = dyn_cast<PHINode>(UI)) {
+        // Sigma nodes at the top of Branch keep the original value.
+        if (UseBB == Branch)
+          continue;
+        UseBB = Phi->getIncomingBlock(U);
+      }
+      if (DT.dominates(Branch, UseBB))
+        U.set(Sigma);
     }
   }
 }
 
-/// Split the live range of a variable v along the
-/// edge l' -> l, if:
-/// 1) v depend transitively on a or b from cond(a,b)
-/// 2) v is used in a label dominated by l
-/// (we do this by inserting a copy of v).
+/// Collects into \p Copies the dependents in \p Pred that are used in blocks
+/// dominated by \p Branch, together with the chain of instructions that
+/// leads to them from one of \p Roots. These values get a copy in \p Branch.
 static void getDominatedDependences(const std::map<Value *, Value *> &Pred,
+                                    ArrayRef<Value *> Roots,
                                     std::set<Instruction *> &Copies,
                                     BasicBlock *Branch, DominatorTree &DT) {
   for (const auto &Entry : Pred) {
@@ -63,8 +86,9 @@ static void getDominatedDependences(const std::map<Value *, Value *> &Pred,
           Instruction *UI = dyn_cast<Instruction>(U);
           return UI && DT.dominates(Branch, UI->getParent());
         })) {
+      // Walk back to the root, which gets a sigma node instead of a copy.
       Value *Cur = I;
-      while (Cur) {
+      while (Cur && !is_contained(Roots, Cur)) {
         if (Instruction *CurI = dyn_cast<Instruction>(Cur))
           Copies.insert(CurI);
         auto It = Pred.find(Cur);
@@ -74,16 +98,25 @@ static void getDominatedDependences(const std::map<Value *, Value *> &Pred,
   }
 }
 
-/// Recursively collect instructions that depend transitively
-/// on \p V. Results are added to \p Dependents; \p Pred maps
-/// each dependent instruction to the value it was reached from.
-static void getDependences(Value *V, std::set<Instruction *> &Dependents,
+/// Returns true if \p I can be duplicated at a branch target, that is, if it
+/// computes a value from its operands only.
+static bool isCopyable(const Instruction *I) {
+  return !isa<PHINode>(I) && !isa<ICmpInst>(I) && !I->isTerminator() &&
+         !I->mayReadOrWriteMemory() && !I->mayHaveSideEffects() &&
+         !I->getType()->isVoidTy();
+}
+
+/// Collects into \p Dependents the copyable instructions of \p BB that
+/// depend transitively on \p V, without going through \p Roots. \p Pred maps
+/// each dependent to the value it was reached from.
+static void getDependences(Value *V, ArrayRef<Value *> Roots,
+                           std::set<Instruction *> &Dependents,
                            std::map<Value *, Value *> &Pred, BasicBlock *BB) {
   if (!V || isa<Constant>(V))
     return;
   for (User *U : V->users()) {
     Instruction *I = dyn_cast<Instruction>(U);
-    if (!I || isa<PHINode>(I) || isa<ICmpInst>(I))
+    if (!I || !isCopyable(I) || is_contained(Roots, I))
       continue;
     if (I->getParent() != BB)
       continue;
@@ -91,16 +124,14 @@ static void getDependences(Value *V, std::set<Instruction *> &Dependents,
       continue;
     Dependents.insert(I);
     Pred[I] = V;
-    getDependences(I, Dependents, Pred, BB);
+    getDependences(I, Roots, Dependents, Pred, BB);
   }
 }
 
-/// Insert copies from \p ToBeCopied into \p Branch, inserting
-/// them after the last phi node.
-/// Operands of the clones are rewritten to refer to other clones
-/// (e.g. x.t = b + y --> x.t = b.t + y)
-/// Iteration follows the original order in \p BB to respect
-/// def-use ordering.
+/// Inserts copies of \p ToBeCopied after the phi nodes of \p Branch, in
+/// their order in \p BB. Operands of the copies, and of the instructions of
+/// \p Branch, are rewritten to use the copies (x.t = b + y becomes
+/// x.t = b.t + y). Returns the map from each original to its copy.
 static std::map<Instruction *, Instruction *>
 copyAndInsert(const std::set<Instruction *> &ToBeCopied, BasicBlock *Branch,
               BasicBlock *BB, StringRef Suffix) {
@@ -139,31 +170,41 @@ copyAndInsert(const std::set<Instruction *> &ToBeCopied, BasicBlock *Branch,
   return Copies;
 }
 
-/// Orchestrate E-SSA construction for a single conditional branch.
-/// Insert sigma nodes for \p LHS and \p RHS at the top of each
-/// true and false branch, with \p BB as the single incoming block.
-/// Sigma nodes are represented with phi nodes tagged with a "sigma"
-/// + \p Suffix metadata for downstream passes.
-static void insertSigmaNodes(Value *LHS, Value *RHS, BasicBlock *TrueBranch,
+/// Inserts sigma nodes for \p Operands, and copies of the values computed
+/// from them in \p BB, at the top of \p TrueBranch and \p FalseBranch, the
+/// successors of the conditional branch that ends \p BB.
+static void insertSigmaNodes(ArrayRef<Value *> Operands, BasicBlock *TrueBranch,
                              BasicBlock *FalseBranch, BasicBlock *BB,
                              DominatorTree &DT) {
-  std::set<Instruction *> DependentsOnLHS, DependentsOnRHS;
-  std::map<Value *, Value *> Pred;
+  bool SplitTB = canSplitInto(TrueBranch, BB);
+  bool SplitFB = canSplitInto(FalseBranch, BB);
+  SmallVector<Value *, 4> Roots;
+  for (Value *V : Operands)
+    if (isRedefinable(V) && !is_contained(Roots, V))
+      Roots.push_back(V);
+  if (Roots.empty() || (!SplitTB && !SplitFB))
+    return;
 
-  getDependences(LHS, DependentsOnLHS, Pred, BB);
-  getDependences(RHS, DependentsOnRHS, Pred, BB);
+  std::set<Instruction *> Dependents;
+  std::map<Value *, Value *> Pred;
+  for (Value *Root : Roots)
+    getDependences(Root, Roots, Dependents, Pred, BB);
 
   std::set<Instruction *> ToBeCopiedTB, ToBeCopiedFB;
-  getDominatedDependences(Pred, ToBeCopiedTB, TrueBranch, DT);
-  getDominatedDependences(Pred, ToBeCopiedFB, FalseBranch, DT);
+  if (SplitTB)
+    getDominatedDependences(Pred, Roots, ToBeCopiedTB, TrueBranch, DT);
+  if (SplitFB)
+    getDominatedDependences(Pred, Roots, ToBeCopiedFB, FalseBranch, DT);
 
   std::map<Instruction *, Instruction *> CopiesTB =
       copyAndInsert(ToBeCopiedTB, TrueBranch, BB, ".t");
   std::map<Instruction *, Instruction *> CopiesFB =
       copyAndInsert(ToBeCopiedFB, FalseBranch, BB, ".f");
 
-  insertPHIs(LHS, RHS, TrueBranch, BB, ".t");
-  insertPHIs(LHS, RHS, FalseBranch, BB, ".f");
+  if (SplitTB)
+    insertPHIs(Roots, TrueBranch, BB, ".t", DT);
+  if (SplitFB)
+    insertPHIs(Roots, FalseBranch, BB, ".f", DT);
 
   std::map<Instruction *, Instruction *> AllCopies = CopiesTB;
   AllCopies.insert(CopiesFB.begin(), CopiesFB.end());
@@ -186,7 +227,7 @@ static void insertSigmaNodes(Value *LHS, Value *RHS, BasicBlock *TrueBranch,
     } else {
       continue;
     }
-    for (Use &U : OG->uses()) {
+    for (Use &U : make_early_inc_range(OG->uses())) {
       auto *UserInst = dyn_cast<Instruction>(U.getUser());
       if (!UserInst)
         continue;
@@ -198,26 +239,65 @@ static void insertSigmaNodes(Value *LHS, Value *RHS, BasicBlock *TrueBranch,
   }
 }
 
+/// Collects into \p Out the integer comparisons that make up the branch
+/// condition \p Cond: the condition itself, or the leaves of logical and,
+/// or and not (including their select forms), as in `i < n && i < 100`.
+static void collectComparisons(Value *Cond, SmallVectorImpl<ICmpInst *> &Out,
+                               unsigned Depth = 0) {
+  using namespace PatternMatch;
+  Value *A, *B;
+  if (auto *Cmp = dyn_cast<ICmpInst>(Cond)) {
+    if (Cmp->getOperand(0)->getType()->isIntegerTy())
+      Out.push_back(Cmp);
+  } else if (Depth < 4 && (match(Cond, m_LogicalAnd(m_Value(A), m_Value(B))) ||
+                           match(Cond, m_LogicalOr(m_Value(A), m_Value(B))))) {
+    collectComparisons(A, Out, Depth + 1);
+    collectComparisons(B, Out, Depth + 1);
+  } else if (Depth < 4 && match(Cond, m_Not(m_Value(A)))) {
+    collectComparisons(A, Out, Depth + 1);
+  }
+}
+
 PreservedAnalyses ESSAfier::run(Function &F, FunctionAnalysisManager &FAM) {
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+  // A branch target with other predecessors cannot hold sigma nodes, since
+  // they would be wrong on the other incoming paths. Splitting the edge gives
+  // the target a block of its own.
+  if (SplitCriticalEdges) {
+    SmallVector<std::pair<Instruction *, unsigned>, 16> Edges;
+    for (BasicBlock &BB : F)
+      if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
+        if (BI->isConditional()) {
+          SmallVector<ICmpInst *, 4> Cmps;
+          collectComparisons(BI->getCondition(), Cmps);
+          if (Cmps.empty())
+            continue;
+          for (unsigned I = 0; I < 2; ++I)
+            if (isCriticalEdge(BI, I))
+              Edges.push_back({BI, I});
+        }
+    for (auto [TI, I] : Edges)
+      SplitCriticalEdge(TI, I, CriticalEdgeSplittingOptions(&DT));
+  }
 
   for (BasicBlock &BB : F) {
     auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
     if (!BI || !BI->isConditional())
       continue;
 
-    Value *LHS, *RHS;
-    if (auto *ICmp = dyn_cast<ICmpInst>(BI->getCondition())) {
-      LHS = ICmp->getOperand(0);
-      RHS = ICmp->getOperand(1);
-    } else {
+    SmallVector<ICmpInst *, 4> Cmps;
+    collectComparisons(BI->getCondition(), Cmps);
+    if (Cmps.empty())
       continue;
-    }
+    SmallVector<Value *, 8> Operands;
+    for (ICmpInst *Cmp : Cmps)
+      Operands.append({Cmp->getOperand(0), Cmp->getOperand(1)});
 
     BasicBlock *TrueBranch = BI->getSuccessor(0);
     BasicBlock *FalseBranch = BI->getSuccessor(1);
 
-    insertSigmaNodes(LHS, RHS, TrueBranch, FalseBranch, &BB, DT);
+    insertSigmaNodes(Operands, TrueBranch, FalseBranch, &BB, DT);
   }
   return PreservedAnalyses::none();
 }
