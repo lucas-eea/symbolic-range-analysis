@@ -16,10 +16,16 @@ add_llvm_pass_plugin(ESSAfier
 )
 add_llvm_pass_plugin(SymbolicRanges
   lib/SymbolicRangeAnalysis.cpp
+  lib/ExactValues.cpp
+  lib/SymBoxes.cpp
   lib/GiNaCGlue.cpp
+)
+add_llvm_pass_plugin(SRACVP
+  lib/SRACVP.cpp
 )
 add_executable(symboxes
   tests/testSymBoxes.cpp
+  lib/SymBoxes.cpp
   lib/GiNaCGlue.cpp
 )
 
@@ -36,6 +42,8 @@ execute_process(
 
 target_compile_options(ESSAfier PRIVATE ${LLVM_DEFINITIONS_LIST})
 target_compile_options(SymbolicRanges PRIVATE ${LLVM_DEFINITIONS_LIST} -frtti -fexceptions)
+target_compile_options(SRACVP PRIVATE ${LLVM_DEFINITIONS_LIST})
+target_compile_definitions(SRACVP PRIVATE SRA_BUILD_DIR="${CMAKE_BINARY_DIR}")
 
 target_link_libraries(symboxes PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} ginac cln)
 target_link_libraries(SymbolicRanges PRIVATE ginac cln)
