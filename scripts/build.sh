@@ -3,6 +3,6 @@ set -e
 
 mkdir -p build
 cd build
-cmake -G Ninja .. \
+cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_DIR=${LLVM_DIR:-"$(llvm-config --prefix)/lib/cmake/llvm"}
 ninja
