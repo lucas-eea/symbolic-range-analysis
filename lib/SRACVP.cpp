@@ -38,6 +38,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -48,6 +49,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
@@ -63,6 +65,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <chrono>
+#include <map>
 #include <optional>
 
 using namespace llvm;
@@ -105,6 +108,12 @@ static cl::opt<std::string> FactsMode(
              "where poison would already be UB, range attributes on internal "
              "functions' arguments); check (every fact becomes a runtime test "
              "that traps if it is violated)"));
+static cl::opt<std::string> AsanSafe(
+    "sra-cvp-asan", cl::init("none"),
+    cl::desc("Prove that loads and stores of sanitize_address functions stay in "
+             "the bounds of their object: none; tag (add !nosanitize, so that "
+             "AddressSanitizer does not instrument them); check (add a run-time "
+             "test that traps if the proof is wrong)"));
 static cl::opt<std::string> DumpInput(
     "sra-cvp-dump-input", cl::init(""), cl::Hidden,
     cl::desc("Write the module as sra-cvp receives it to this file (debugging)"));
@@ -258,6 +267,790 @@ static unsigned applyAliasFacts(Module &C, const std::vector<Instruction *> &ByI
     }
   }
   return Pairs;
+}
+
+/// A load or store that stays in bounds if every comparison in Cmps is true
+/// (-sra-cvp-asan).
+struct BoundsGoal {
+  Instruction *Access;
+  SmallVector<ICmpInst *, 4> Cmps;
+};
+
+/// Collects, in \p Dims, the variable indices of the getelementptr chain
+/// that computes \p Ptr together with the number of elements of the array
+/// each one indexes. Returns false unless \p Ptr points into a global or a
+/// static alloca of known size and an access of \p NeedBytes bytes stays in
+/// that object whenever each index is below its dimension: every
+/// getelementptr must start with index 0, have constant indices in bounds,
+/// and address an element that holds what is accessed through it.
+static bool boundsDims(Value *Ptr, uint64_t NeedBytes, const DataLayout &DL,
+                       SmallVectorImpl<std::pair<Value *, uint64_t>> &Dims) {
+  Value *P = Ptr;
+  while (auto *G = dyn_cast<GEPOperator>(P)) {
+    auto *First = dyn_cast<ConstantInt>(G->getOperand(1));
+    if (!First || !First->isZero())
+      return false;
+    Type *T = G->getSourceElementType();
+    for (unsigned K = 2, E = G->getNumOperands(); K < E; ++K) {
+      Value *Idx = G->getOperand(K);
+      if (auto *AT = dyn_cast<ArrayType>(T)) {
+        uint64_t N = AT->getNumElements();
+        if (auto *C = dyn_cast<ConstantInt>(Idx)) {
+          if (C->getValue().uge(N))
+            return false;
+        } else {
+          Dims.push_back({Idx, N});
+        }
+        T = AT->getElementType();
+      } else if (auto *ST = dyn_cast<StructType>(T)) {
+        T = ST->getElementType(cast<ConstantInt>(Idx)->getZExtValue());
+      } else {
+        return false;
+      }
+    }
+    if (!T->isSized() || NeedBytes > DL.getTypeAllocSize(T).getKnownMinValue())
+      return false;
+    NeedBytes = DL.getTypeAllocSize(G->getSourceElementType()).getKnownMinValue();
+    P = G->getPointerOperand();
+  }
+  if (auto *GV = dyn_cast<GlobalVariable>(P))
+    return !GV->isDeclaration() && !GV->isInterposable() &&
+           GV->getValueType()->isSized() &&
+           NeedBytes <= DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
+  if (auto *AI = dyn_cast<AllocaInst>(P)) {
+    std::optional<TypeSize> S = AI->getAllocationSize(DL);
+    return AI->isStaticAlloca() && S && !S->isScalable() && NeedBytes <= S->getFixedValue();
+  }
+  return false;
+}
+
+/// Returns the loads and stores of \p F that AddressSanitizer instruments,
+/// with their address and accessed type.
+static SmallVector<std::tuple<Instruction *, Value *, Type *>, 0>
+sanitizedAccesses(Function &F) {
+  SmallVector<std::tuple<Instruction *, Value *, Type *>, 0> R;
+  if (F.isDeclaration() || !F.hasFnAttribute(Attribute::SanitizeAddress) || !rewriteAllowed(F))
+    return R;
+  for (Instruction &I : instructions(F)) {
+    if (auto *L = dyn_cast<LoadInst>(&I))
+      R.push_back({&I, L->getPointerOperand(), L->getType()});
+    else if (auto *S = dyn_cast<StoreInst>(&I))
+      R.push_back({&I, S->getPointerOperand(), S->getValueOperand()->getType()});
+  }
+  return R;
+}
+
+/// Adds, before every sanitized load and store whose address comes from a
+/// getelementptr chain into an object of known size, one comparison
+/// `index ult dimension` per variable index, for SRA to decide
+/// (-sra-cvp-asan-regions=false). \p Proven gets the accesses with only
+/// constant indices, \p Shadow every instruction added.
+static std::vector<BoundsGoal> addBoundsGoals(Module &M, std::vector<Instruction *> &Proven,
+                                              std::vector<Instruction *> &Shadow) {
+  std::vector<BoundsGoal> Goals;
+  const DataLayout &DL = M.getDataLayout();
+  for (Function &F : M)
+    for (auto [I, Ptr, Ty] : sanitizedAccesses(F)) {
+      if (!isa<GEPOperator>(Ptr) || !Ty->isSized() || DL.getTypeStoreSize(Ty).isScalable())
+        continue;
+      SmallVector<std::pair<Value *, uint64_t>, 4> Dims;
+      if (!boundsDims(Ptr, DL.getTypeStoreSize(Ty).getFixedValue(), DL, Dims))
+        continue;
+      BoundsGoal G{I, {}};
+      IRBuilder<> B(I);
+      for (auto [Idx, N] : Dims) {
+        unsigned W = Idx->getType()->getIntegerBitWidth();
+        if (W < 64 && N >= (uint64_t(1) << W))
+          continue; // Every value of the index is below N.
+        auto *C = cast<ICmpInst>(
+            B.CreateICmpULT(Idx, ConstantInt::get(Idx->getType(), N), "sra.asan"));
+        G.Cmps.push_back(C);
+        Shadow.push_back(C);
+      }
+      if (G.Cmps.empty())
+        Proven.push_back(I);
+      else
+        Goals.push_back(std::move(G));
+    }
+  return Goals;
+}
+
+static cl::opt<bool> AsanRegions(
+    "sra-cvp-asan-regions", cl::init(true),
+    cl::desc("With -sra-cvp-asan, prove accesses with the symbolic region analysis "
+             "of OOPSLA'14 (Section 4.4); false: only getelementptr chains into "
+             "globals and static allocas, one comparison per index"));
+static cl::opt<std::string> AsanParams(
+    "sra-cvp-asan-params", cl::init("internal"),
+    cl::desc("Regions of pointer parameters, from their call sites (OOPSLA'14, "
+             "Section 4.6): none; internal (functions only called directly, with "
+             "local linkage); all (also external functions, which assumes that "
+             "the module is the whole program)"));
+
+/// Returns true if \p F is the library function \p Name.
+static bool isLibFn(const Function *F, StringRef Name) {
+  return F && F->isDeclaration() && F->getName() == Name;
+}
+
+/// Returns true if \p V calls malloc, calloc, realloc, operator new or
+/// operator new[], whose result is a new region of known size.
+static bool isAllocation(const Value *V) {
+  auto *CB = dyn_cast<CallBase>(V);
+  if (!CB)
+    return false;
+  const Function *F = CB->getCalledFunction();
+  auto IntArg = [&](unsigned K) {
+    return CB->arg_size() > K && CB->getArgOperand(K)->getType()->isIntegerTy();
+  };
+  return ((isLibFn(F, "malloc") || isLibFn(F, "_Znwm") || isLibFn(F, "_Znam")) && IntArg(0)) ||
+         (isLibFn(F, "calloc") && IntArg(0) && IntArg(1)) ||
+         (isLibFn(F, "realloc") && IntArg(1));
+}
+
+/// Returns the argument of \p CB that it frees: the pointer of free,
+/// realloc, operator delete and operator delete[], or null.
+static Value *freedArg(const CallBase &CB) {
+  const Function *F = CB.getCalledFunction();
+  if (!F || !F->isDeclaration() || CB.arg_size() == 0 ||
+      !CB.getArgOperand(0)->getType()->isPointerTy())
+    return nullptr;
+  StringRef N = F->getName();
+  if (N == "free" || N == "realloc" || N.starts_with("_ZdlPv") || N.starts_with("_ZdaPv"))
+    return CB.getArgOperand(0);
+  return nullptr;
+}
+
+/// Returns the functions of \p M that may free memory they did not allocate:
+/// those that call a freeing function, call through a pointer, or call such
+/// a function. Other library functions are assumed not to free their
+/// arguments.
+static DenseSet<const Function *> mayFreeFunctions(Module &M) {
+  DenseSet<const Function *> R;
+  for (bool Changed = true; Changed;) {
+    Changed = false;
+    for (Function &F : M) {
+      if (F.isDeclaration() || R.contains(&F))
+        continue;
+      bool Frees = any_of(instructions(F), [&](Instruction &I) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || isa<IntrinsicInst>(CB))
+          return false;
+        const Function *G = CB->getCalledFunction();
+        return !G || freedArg(*CB) || R.contains(G);
+      });
+      if (Frees)
+        R.insert(&F), Changed = true;
+    }
+  }
+  return R;
+}
+
+/// An i64 placeholder for a value that sra-cvp gives a pointer parameter's
+/// region in the analysis only: an opaque call, which SRA sees as unknown.
+static CallInst *placeholder(Module &M, IRBuilderBase &B, const Twine &Name) {
+  FunctionCallee Fn = M.getOrInsertFunction(
+      "sra.asan.param", FunctionType::get(B.getInt64Ty(), /*isVarArg=*/false));
+  return B.CreateCall(Fn, {}, Name);
+}
+
+/// The element size through which a function indexes its pointer parameter
+/// \p A: the size of the source element type of the getelementptrs based on
+/// \p A, if they all agree; 1 otherwise. A parameter's region is given in
+/// these units, so that indices and sizes can be compared (OOPSLA'14
+/// counts in elements).
+static uint64_t paramUnit(const Argument &A, const DataLayout &DL) {
+  uint64_t E = 0;
+  for (const User *U : A.users())
+    if (auto *G = dyn_cast<GetElementPtrInst>(U); G && G->getPointerOperand() == &A) {
+      Type *T = G->getSourceElementType();
+      if (!T->isSized() || DL.getTypeAllocSize(T).isScalable())
+        return 1;
+      uint64_t S = DL.getTypeAllocSize(T).getFixedValue();
+      if (S == 0 || (E && S != E))
+        return 1;
+      E = S;
+    }
+  return E ? E : 1;
+}
+
+/// An IRBuilder inserting before an instruction that records in a list
+/// every instruction it creates.
+struct ShadowBuilder : IRBuilder<ConstantFolder, IRBuilderCallbackInserter> {
+  ShadowBuilder(Instruction *At, std::vector<Instruction *> &Shadow)
+      : IRBuilder(At->getContext(), ConstantFolder(),
+                  IRBuilderCallbackInserter([&Shadow](Instruction *I) { Shadow.push_back(I); })) {
+    SetInsertPoint(At);
+  }
+};
+
+/// The two values that sra-cvp passes, in the analysis only, for a pointer
+/// parameter: the bytes valid before the pointer and the elements of
+/// paramUnit valid from it.
+struct ParamSlot {
+  Function *F;
+  unsigned ArgNo;
+  CallInst *Back, *Fwd;
+};
+
+namespace {
+
+/// The symbolic region analysis of OOPSLA'14 (Section 4.4) for one function.
+/// The paper binds every pointer p to W(p), the interval of offsets valid
+/// from p, and proves *p safe when 0 is in W(p). Here W(p) is
+/// [-Back(p), Fwd(p) - 1], in bytes, where Back(p) and Fwd(p) are i64
+/// values materialized next to the pointers, so that SRA bounds them
+/// symbolically:
+///  - an allocation (global, alloca, malloc, calloc, realloc, new) has
+///    Back = 0 and Fwd = its size;
+///  - p + k (getelementptr) has Back(p) + k and Fwd(p) - k, which the
+///    paper writes [W(p)↓ - R(k)↓, W(p)↑ - R(k)↑] once SRA bounds them;
+///  - a phi or select of pointers has the phi or select of their Back and
+///    Fwd: SRA's range of it is the union of theirs, and its lower bound,
+///    the only one the proof uses, is the paper's meet (narrowest region),
+///    also across different objects; SRA's widening plays the role of the
+///    paper's lower widening;
+///  - a pointer parameter gets Back and Fwd from its call sites
+///    (Section 4.6, see ParamSlot); any other pointer (loaded, returned by a
+///    call, built from an integer) has no region (the paper's empty region).
+/// After free(p), the paper renames the aliases of p (from a points-to
+/// analysis) to the empty region. Here an access has no region if a free of
+/// its object may come before it: free of a pointer to it, free of a pointer
+/// to unknown objects or a call to a function that may free (for heap and
+/// parameter objects, whatever aliases they have), or lifetime.end (for an
+/// alloca, so that AddressSanitizer still sees uses after scope).
+class RegionAnalysis {
+public:
+  RegionAnalysis(Function &F, const DataLayout &DL, bool Params,
+                 const DenseSet<const Function *> &MayFree, std::vector<Instruction *> &Shadow,
+                 std::vector<ParamSlot> &Slots)
+      : DL(DL), Shadow(Shadow), I64(Type::getInt64Ty(F.getContext())) {
+    if (Params && F.getName() != "main") {
+      ShadowBuilder B(&*F.getEntryBlock().getFirstInsertionPt(), Shadow);
+      for (Argument &A : F.args())
+        if (A.getType()->isPointerTy()) {
+          CallInst *Bk = placeholder(*F.getParent(), B, "sra.back");
+          CallInst *Fw = placeholder(*F.getParent(), B, "sra.fwd");
+          Slots.push_back({&F, A.getArgNo(), Bk, Fw});
+          Back[&A] = Bk;
+          Fwd[&A] = B.CreateMul(Fw, ConstantInt::get(I64, paramUnit(A, DL)), "sra.fwd", true, true);
+        }
+    }
+    // Which objects each pointer may point into.
+    ReversePostOrderTraversal<Function *> RPOT(&F);
+    for (bool Changed = true; Changed;) {
+      Changed = false;
+      for (BasicBlock *BB : RPOT)
+        for (Instruction &I : *BB) {
+          if (!I.getType()->isPointerTy())
+            continue;
+          Objs New = transfer(I);
+          Objs &Old = Of[&I];
+          if (New != Old)
+            Old = std::move(New), Changed = true;
+        }
+    }
+    // Where each object may be freed. A free of a pointer to unknown
+    // objects, or a call to a function that may free, may free every heap
+    // and parameter object (whatever aliases it was stored in); globals are
+    // never freed, and an alloca only ends at lifetime.end.
+    for (BasicBlock *BB : RPOT)
+      for (Instruction &I : *BB) {
+        auto Kill = [&](Value *P) {
+          Objs O = objsOf(P);
+          if (O.Unknown)
+            FreeAll.push_back(&I);
+          for (Value *X : O.Set)
+            if (!isa<GlobalVariable>(X))
+              Frees[X].push_back(&I);
+        };
+        if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+          Intrinsic::ID ID = II->getIntrinsicID();
+          if (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end) {
+            Value *P = II->getArgOperand(II->arg_size() - 1);
+            for (Value *X : objsOf(P).Set)
+              if (isa<AllocaInst>(X))
+                Scope[X].push_back(II);
+            if (ID == Intrinsic::lifetime_end)
+              Kill(P);
+          }
+          continue;
+        }
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+        if (Value *P = freedArg(*CB)) {
+          Kill(P);
+          continue;
+        }
+        const Function *G = CB->getCalledFunction();
+        if (!G || MayFree.contains(G))
+          FreeAll.push_back(&I);
+      }
+  }
+
+  /// Returns true if \p P has a region (Back and Fwd) and is not freed at
+  /// \p At.
+  bool usable(Value *P, Instruction *At) {
+    Objs S = objsOf(P);
+    if (S.Unknown || S.Set.empty())
+      return false;
+    for (Value *O : S.Set) {
+      if (isa<AllocaInst>(O)) {
+        if (Scope.contains(O) && outOfScope(cast<AllocaInst>(O), At))
+          return false;
+        continue;
+      }
+      for (Instruction *K : Frees.lookup(O))
+        if (isPotentiallyReachable(K, At))
+          return false;
+      if (isa<CallBase>(O) || isa<Argument>(O))
+        for (Instruction *K : FreeAll)
+          if (isPotentiallyReachable(K, At))
+            return false;
+    }
+    return true;
+  }
+
+  /// Returns true if \p At may run while the alloca \p O, which has
+  /// lifetime markers, is out of scope: reachable from the function's entry
+  /// or from a lifetime.end of \p O without a lifetime.start of \p O on
+  /// the way (AddressSanitizer reports such uses).
+  bool outOfScope(AllocaInst *O, Instruction *At) {
+    const auto &Marks = Scope.find(O)->second;
+    auto IsStart = [&](Instruction &I) {
+      auto *II = dyn_cast<IntrinsicInst>(&I);
+      return II && II->getIntrinsicID() == Intrinsic::lifetime_start && is_contained(Marks, II);
+    };
+    // Scans from \p It to the end of its block: true if At comes first,
+    // and adds the successors if neither At nor a start does.
+    SmallPtrSet<BasicBlock *, 16> Seen;
+    SmallVector<BasicBlock *, 16> Work;
+    auto Scan = [&](BasicBlock::iterator It, BasicBlock *BB) {
+      for (; It != BB->end(); ++It) {
+        if (&*It == At)
+          return true;
+        if (IsStart(*It))
+          return false;
+      }
+      for (BasicBlock *Succ : successors(BB))
+        if (Seen.insert(Succ).second)
+          Work.push_back(Succ);
+      return false;
+    };
+    BasicBlock *Entry = &At->getFunction()->getEntryBlock();
+    Seen.insert(Entry);
+    if (Scan(Entry->begin(), Entry))
+      return true;
+    for (Instruction *M : Marks)
+      if (cast<IntrinsicInst>(M)->getIntrinsicID() == Intrinsic::lifetime_end &&
+          Scan(std::next(M->getIterator()), M->getParent()))
+        return true;
+    while (!Work.empty()) {
+      BasicBlock *BB = Work.pop_back_val();
+      if (Scan(BB->begin(), BB))
+        return true;
+    }
+    return false;
+  }
+
+  /// Bytes valid before \p P.
+  Value *back(Value *P) { return get(P, true); }
+  /// Bytes valid from \p P on.
+  Value *fwd(Value *P) { return get(P, false); }
+
+private:
+  /// The objects a pointer may point into; Unknown if it may point
+  /// anywhere else.
+  struct Objs {
+    SmallSetVector<Value *, 4> Set;
+    bool Unknown = false;
+    bool operator!=(const Objs &O) const { return Unknown != O.Unknown || Set != O.Set; }
+  };
+
+  const DataLayout &DL;
+  std::vector<Instruction *> &Shadow;
+  Type *I64;
+  DenseMap<Value *, Objs> Of;
+  DenseMap<Value *, Value *> Back, Fwd;
+  DenseMap<Value *, SmallVector<Instruction *, 2>> Frees;
+  SmallVector<Instruction *, 4> FreeAll;
+  DenseMap<Value *, SmallVector<Instruction *, 2>> Scope; // lifetime markers
+
+  /// Returns true if \p V is an object: an allocation, or a pointer
+  /// parameter that gets a region from its call sites.
+  bool isObject(const Value *V) const {
+    if (auto *GV = dyn_cast<GlobalVariable>(V))
+      return !GV->isDeclaration() && !GV->isInterposable() && GV->getValueType()->isSized();
+    if (auto *AI = dyn_cast<AllocaInst>(V))
+      return AI->getAllocatedType()->isSized() &&
+             !DL.getTypeAllocSize(AI->getAllocatedType()).isScalable();
+    if (isa<Argument>(V))
+      return Back.contains(V);
+    return isAllocation(V);
+  }
+
+  /// Returns true if \p G's offset can be materialized.
+  static bool plainGEP(const GEPOperator &G) {
+    if (G.getType()->isVectorTy())
+      return false;
+    for (gep_type_iterator GTI = gep_type_begin(G), E = gep_type_end(G); GTI != E; ++GTI)
+      if (!GTI.isStruct() && GTI.getIndexedType()->isScalableTy())
+        return false;
+    return true;
+  }
+
+  static Objs join(Objs A, const Objs &B) {
+    A.Unknown |= B.Unknown;
+    A.Set.insert(B.Set.begin(), B.Set.end());
+    return A;
+  }
+
+  Objs objsOf(Value *V) {
+    Objs R;
+    if (isObject(V)) {
+      R.Set.insert(V);
+      return R;
+    }
+    if (auto *G = dyn_cast<GEPOperator>(V); G && !isa<Instruction>(V)) {
+      APInt C(64, 0);
+      if (!plainGEP(*G) || !G->accumulateConstantOffset(DL, C)) {
+        R.Unknown = true;
+        return R;
+      }
+      return objsOf(G->getPointerOperand());
+    }
+    if (isa<Instruction>(V))
+      return Of.lookup(V);
+    R.Unknown = true; // null, other constants, arguments without a region
+    return R;
+  }
+
+  Objs transfer(Instruction &I) {
+    if (isObject(&I))
+      return objsOf(&I);
+    if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+      if (!plainGEP(*cast<GEPOperator>(G))) {
+        Objs R;
+        R.Unknown = true;
+        return R;
+      }
+      return objsOf(G->getPointerOperand());
+    }
+    if (auto *Phi = dyn_cast<PHINode>(&I)) {
+      Objs S;
+      for (Value *In : Phi->incoming_values())
+        if (!isa<UndefValue>(In))
+          S = join(std::move(S), objsOf(In));
+      return S;
+    }
+    if (auto *Sel = dyn_cast<SelectInst>(&I))
+      return join(objsOf(Sel->getTrueValue()), objsOf(Sel->getFalseValue()));
+    Objs R;
+    R.Unknown = true;
+    return R;
+  }
+
+  /// Back(P) (\p IsBack) or Fwd(P), materialized on first use.
+  Value *get(Value *P, bool IsBack) {
+    auto &Map = IsBack ? Back : Fwd;
+    if (Value *V = Map.lookup(P))
+      return V;
+    Value *R;
+    if (isObject(P)) {
+      R = IsBack ? ConstantInt::get(I64, 0) : sizeOf(P);
+    } else if (auto *G = dyn_cast<GEPOperator>(P); G && !isa<Instruction>(P)) {
+      APInt C(64, 0);
+      G->accumulateConstantOffset(DL, C);
+      auto *Base = cast<Constant>(get(G->getPointerOperand(), IsBack));
+      Constant *K = ConstantInt::get(I64, C);
+      R = IsBack ? ConstantExpr::getAdd(Base, K) : ConstantExpr::getSub(Base, K);
+    } else if (auto *G = dyn_cast<GetElementPtrInst>(P)) {
+      Value *Base = get(G->getPointerOperand(), IsBack);
+      ShadowBuilder B(G, Shadow);
+      // inbounds: the offsets do not wrap (LangRef); sra++ needs nsw to
+      // bound a pointer stepped in a loop as an induction variable.
+      bool NSW = G->isInBounds();
+      Value *Off = ConstantInt::get(I64, 0);
+      for (gep_type_iterator GTI = gep_type_begin(G), E = gep_type_end(G); GTI != E; ++GTI) {
+        Value *Idx = GTI.getOperand();
+        Value *Step;
+        if (StructType *ST = GTI.getStructTypeOrNull())
+          Step = ConstantInt::get(I64, DL.getStructLayout(ST)->getElementOffset(
+                                           cast<ConstantInt>(Idx)->getZExtValue()));
+        else
+          Step = B.CreateMul(B.CreateSExtOrTrunc(Idx, I64, "sra.idx"),
+                             ConstantInt::get(I64, GTI.getSequentialElementStride(DL)), "sra.off",
+                             false, NSW);
+        Off = B.CreateAdd(Off, Step, "sra.off", false, NSW);
+      }
+      R = IsBack ? B.CreateAdd(Base, Off, "sra.back", false, NSW)
+                 : B.CreateSub(Base, Off, "sra.fwd", false, NSW);
+    } else if (auto *Phi = dyn_cast<PHINode>(P)) {
+      PHINode *O = PHINode::Create(I64, Phi->getNumIncomingValues(),
+                                   IsBack ? "sra.back" : "sra.fwd", Phi->getIterator());
+      Shadow.push_back(O);
+      Map[P] = O;
+      for (unsigned K = 0, E = Phi->getNumIncomingValues(); K < E; ++K) {
+        Value *In = Phi->getIncomingValue(K);
+        // An undefined pointer, or one from a block never reached, has no
+        // value that matters.
+        bool None = isa<UndefValue>(In) || (isa<Instruction>(In) && !Of.contains(In) &&
+                                            !isObject(In));
+        O->addIncoming(None ? ConstantInt::get(I64, 0) : get(In, IsBack),
+                       Phi->getIncomingBlock(K));
+      }
+      return O;
+    } else {
+      auto *Sel = cast<SelectInst>(P);
+      Value *T = get(Sel->getTrueValue(), IsBack), *F = get(Sel->getFalseValue(), IsBack);
+      R = ShadowBuilder(Sel, Shadow).CreateSelect(Sel->getCondition(), T, F,
+                                                  IsBack ? "sra.back" : "sra.fwd");
+    }
+    Map[P] = R;
+    return R;
+  }
+
+  /// The size in bytes of the object \p O.
+  Value *sizeOf(Value *O) {
+    if (auto *GV = dyn_cast<GlobalVariable>(O))
+      return ConstantInt::get(I64, DL.getTypeAllocSize(GV->getValueType()).getFixedValue());
+    if (auto *AI = dyn_cast<AllocaInst>(O)) {
+      uint64_t Elem = DL.getTypeAllocSize(AI->getAllocatedType()).getFixedValue();
+      ShadowBuilder B(AI->getNextNode(), Shadow);
+      return B.CreateMul(B.CreateZExtOrTrunc(AI->getArraySize(), I64, "sra.size"),
+                         ConstantInt::get(I64, Elem), "sra.size", /*HasNUW=*/true);
+    }
+    auto *CB = cast<CallBase>(O);
+    ShadowBuilder B(CB->getNextNode(), Shadow);
+    StringRef Name = CB->getCalledFunction()->getName();
+    auto Arg = [&](unsigned K) {
+      return B.CreateZExtOrTrunc(CB->getArgOperand(K), I64, "sra.size");
+    };
+    if (Name == "calloc")
+      return B.CreateMul(Arg(0), Arg(1), "sra.size", /*HasNUW=*/true);
+    return Arg(Name == "realloc" ? 1 : 0);
+  }
+};
+
+} // namespace
+
+/// For each direct call in \p M to a function with a ParamSlot, the values
+/// that sra-cvp passes for the slots in the analysis: Back and Fwd (in the
+/// callee's paramUnit) of the actual pointer, or null where it has no
+/// region.
+using CallSlots = DenseMap<CallBase *, SmallVector<std::pair<Value *, Value *>, 2>>;
+
+/// Adds, before every sanitized load and store whose address has a region,
+/// the comparisons `Back >= 0` and `Fwd >= access bytes`, for SRA to decide.
+/// \p Proven gets the accesses whose comparisons fold to true at once,
+/// \p Shadow every instruction added, \p Slots and \p Calls what pointer
+/// parameters need (see -sra-cvp-asan-params).
+static std::vector<BoundsGoal> addRegionGoals(Module &M, std::vector<Instruction *> &Proven,
+                                              std::vector<Instruction *> &Shadow,
+                                              std::vector<ParamSlot> &Slots, CallSlots &Calls) {
+  std::vector<BoundsGoal> Goals;
+  const DataLayout &DL = M.getDataLayout();
+  bool Params = AsanParams != "none";
+  DenseSet<const Function *> MayFree = mayFreeFunctions(M);
+  // Every function's slots first, so that call sites can see them.
+  std::map<Function *, std::unique_ptr<RegionAnalysis>> RAs;
+  SmallVector<Function *, 32> Fns;
+  for (Function &F : M)
+    if (!F.isDeclaration() && F.hasFnAttribute(Attribute::SanitizeAddress) && rewriteAllowed(F))
+      Fns.push_back(&F);
+  for (Function *F : Fns)
+    RAs[F] = std::make_unique<RegionAnalysis>(*F, DL, Params, MayFree, Shadow, Slots);
+  DenseMap<Function *, SmallVector<ParamSlot *, 2>> SlotsOf;
+  for (ParamSlot &S : Slots)
+    SlotsOf[S.F].push_back(&S);
+  for (Function *F : Fns) {
+    RegionAnalysis &RA = *RAs[F];
+    if (Params)
+      for (Instruction &I : instructions(*F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        Function *G = CB ? CB->getCalledFunction() : nullptr;
+        if (!G || !SlotsOf.contains(G) || CB->getFunctionType() != G->getFunctionType())
+          continue;
+        auto &V = Calls[CB];
+        for (ParamSlot *S : SlotsOf[G]) {
+          Value *P = CB->getArgOperand(S->ArgNo);
+          if (!RA.usable(P, CB)) {
+            V.push_back({nullptr, nullptr});
+            continue;
+          }
+          ShadowBuilder B(CB, Shadow);
+          uint64_t E = paramUnit(*G->getArg(S->ArgNo), DL);
+          V.push_back({RA.back(P), B.CreateUDiv(RA.fwd(P), ConstantInt::get(B.getInt64Ty(), E),
+                                                "sra.fwdu")});
+        }
+      }
+    for (auto [I, Ptr, Ty] : sanitizedAccesses(*F)) {
+      if (!Ty->isSized() || DL.getTypeStoreSize(Ty).isScalable() || !RA.usable(Ptr, I))
+        continue;
+      Value *Bk = RA.back(Ptr), *Fw = RA.fwd(Ptr);
+      ShadowBuilder B(I, Shadow);
+      BoundsGoal G{I, {}};
+      bool False = false;
+      for (Value *C : {B.CreateICmpSGE(Bk, ConstantInt::get(Bk->getType(), 0), "sra.asan"),
+                       B.CreateICmpSGE(Fw, ConstantInt::get(Fw->getType(),
+                                                            DL.getTypeStoreSize(Ty).getFixedValue()),
+                                       "sra.asan")}) {
+        if (auto *CI = dyn_cast<ICmpInst>(C))
+          G.Cmps.push_back(CI);
+        else if (!cast<ConstantInt>(C)->isOne())
+          False = true;
+      }
+      if (False)
+        continue;
+      if (G.Cmps.empty())
+        Proven.push_back(I);
+      else
+        Goals.push_back(std::move(G));
+    }
+  }
+  return Goals;
+}
+
+/// Gives, in \p C (the module or a clone of it, \p Map giving the values of
+/// the module in \p C), every function
+/// with ParamSlots two more i64 parameters per pointer parameter, which
+/// replace the slots' placeholders, and passes the values of \p Calls at
+/// every call. SRA's call-site summaries (OOPSLA'14, Fig. 19) then bound
+/// them as they bound integer parameters. With -sra-cvp-asan-params=all,
+/// every function but main gets local linkage first, so that all are
+/// summarized (whole-program assumption). A function whose address is taken
+/// keeps its placeholders, which SRA sees as unknown. \p Wired gets the
+/// placeholders replaced (the module's).
+static void wireParamSlots(Module &C, function_ref<Value *(Value *)> Map,
+                           const std::vector<ParamSlot> &Slots, const CallSlots &Calls,
+                           SmallVectorImpl<Instruction *> *Wired = nullptr) {
+  MapVector<Function *, SmallVector<const ParamSlot *, 2>> ByFn;
+  for (const ParamSlot &S : Slots)
+    ByFn[cast<Function>(Map(S.F))].push_back(&S);
+  DenseMap<Value *, CallBase *> CallOf; // clone's call -> original call
+  for (auto &[CB, V] : Calls)
+    CallOf[Map(CB)] = CB;
+  // Placeholders replaced so far: a call may pass its caller's.
+  DenseMap<Value *, Value *> Replaced;
+  auto Get = [&](Value *V) -> Value * {
+    Value *X = Map(V);
+    return Replaced.lookup(X) ? Replaced.lookup(X) : X;
+  };
+  for (auto &[F, FS] : ByFn) {
+    if (AsanParams == "all" && !F->hasLocalLinkage())
+      F->setLinkage(GlobalValue::InternalLinkage);
+    bool Direct = all_of(F->uses(), [&](const Use &U) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      return CB && CB->isCallee(&U) && CallOf.contains(CB);
+    });
+    if (!F->hasLocalLinkage() || !Direct || F->use_empty())
+      continue;
+    SmallVector<Type *, 8> Tys(F->getFunctionType()->params());
+    Tys.append(2 * FS.size(), Type::getInt64Ty(C.getContext()));
+    auto *NF = Function::Create(FunctionType::get(F->getReturnType(), Tys, false),
+                                F->getLinkage(), F->getAddressSpace(), "", &C);
+    NF->copyAttributesFrom(F);
+    NF->setSubprogram(F->getSubprogram());
+    F->setSubprogram(nullptr);
+    NF->splice(NF->begin(), F);
+    for (auto [Old, New] : zip(F->args(), NF->args())) {
+      New.takeName(&Old);
+      Old.replaceAllUsesWith(&New);
+    }
+    unsigned K = F->arg_size();
+    for (const ParamSlot *S : FS) {
+      for (CallInst *P : {S->Back, S->Fwd}) {
+        auto *CP = cast<Instruction>(Map(P));
+        Replaced[CP] = NF->getArg(K);
+        CP->replaceAllUsesWith(NF->getArg(K++));
+        if (Wired)
+          Wired->push_back(P);
+        CP->eraseFromParent();
+      }
+    }
+    SmallVector<CallBase *, 8> Sites;
+    for (User *U : F->users())
+      Sites.push_back(cast<CallBase>(U));
+    for (CallBase *CB : Sites) {
+      SmallVector<Value *, 8> Args(CB->args());
+      const auto &V = Calls.find(CallOf.lookup(CB))->second;
+      for (auto [Bk, Fw] : V) {
+        // A pointer without a region passes values SRA cannot bound.
+        auto Unknown = [&]() -> Value * {
+          IRBuilder<> B(CB);
+          return placeholder(C, B, "sra.unknown");
+        };
+        Args.push_back(Bk ? Get(Bk) : Unknown());
+        Args.push_back(Fw ? Get(Fw) : Unknown());
+      }
+      auto *NC = CallInst::Create(NF, Args, "", CB->getIterator());
+      NC->setDebugLoc(CB->getDebugLoc());
+      NC->takeName(CB);
+      CB->replaceAllUsesWith(NC);
+      CB->eraseFromParent();
+    }
+    NF->takeName(F);
+    F->eraseFromParent();
+  }
+}
+
+/// Applies -sra-cvp-asan to the accesses of \p Goals whose comparisons SRA
+/// decided true (in \p True) and to those of \p Proven, and erases what
+/// \p Shadow added that the checks of -sra-cvp-asan=check, and the values in
+/// \p Keep0, do not use.
+/// Returns the number of accesses proven.
+static unsigned applyBoundsGoals(std::vector<BoundsGoal> &Goals,
+                                 std::vector<Instruction *> &Proven,
+                                 std::vector<Instruction *> &Shadow,
+                                 const DenseSet<ICmpInst *> &True,
+                                 ArrayRef<Instruction *> Keep0 = {}) {
+  for (BoundsGoal &G : Goals)
+    if (all_of(G.Cmps, [&](ICmpInst *C) { return True.contains(C); }))
+      Proven.push_back(G.Access);
+  bool Check = AsanSafe == "check";
+  DenseSet<Instruction *> Safe(Proven.begin(), Proven.end());
+  // In check mode, the comparisons of the proven accesses and what they
+  // read stay.
+  DenseSet<Instruction *> Keep, ShadowSet(Shadow.begin(), Shadow.end());
+  SmallVector<Instruction *, 32> Work;
+  if (Check) {
+    for (BoundsGoal &G : Goals)
+      if (Safe.contains(G.Access))
+        Work.append(G.Cmps.begin(), G.Cmps.end());
+    Work.append(Keep0.begin(), Keep0.end());
+  }
+  while (!Work.empty()) {
+    Instruction *I = Work.pop_back_val();
+    if (!Keep.insert(I).second)
+      continue;
+    for (Value *Op : I->operands())
+      if (auto *OI = dyn_cast<Instruction>(Op); OI && ShadowSet.contains(OI))
+        Work.push_back(OI);
+  }
+  if (Check)
+    for (BoundsGoal &G : Goals) {
+      if (!Safe.contains(G.Access))
+        continue;
+      IRBuilder<> B(G.Access);
+      Value *Ok = G.Cmps.front();
+      for (ICmpInst *C : drop_begin(G.Cmps))
+        Ok = B.CreateAnd(Ok, C);
+      Instruction *Then = SplitBlockAndInsertIfThen(B.CreateNot(Ok), G.Access->getIterator(),
+                                                    /*Unreachable=*/true);
+      IRBuilder<>(Then).CreateIntrinsic(Intrinsic::trap, {});
+    }
+  SmallVector<Instruction *, 0> Dead;
+  for (Instruction *I : Shadow)
+    if (!Keep.contains(I))
+      Dead.push_back(I);
+  for (Instruction *I : Dead)
+    I->dropAllReferences();
+  for (Instruction *I : Dead)
+    I->eraseFromParent();
+  if (!Check)
+    for (Instruction *I : Proven)
+      I->setMetadata(LLVMContext::MD_nosanitize, MDNode::get(I->getContext(), {}));
+  return Proven.size();
 }
 
 namespace {
@@ -766,12 +1559,42 @@ struct SRACVPPass : PassInfoMixin<SRACVPPass> {
         M.print(OS, nullptr);
     }
     auto Start = std::chrono::steady_clock::now();
+    std::vector<Instruction *> AsanProven, Shadow;
+    std::vector<BoundsGoal> Goals;
+    std::vector<ParamSlot> Slots;
+    CallSlots Calls;
+    SmallVector<Instruction *, 16> CallArgs;
+    DenseSet<ICmpInst *> GoalCmps, GoalTrue;
+    if (AsanSafe != "none") {
+      Goals = AsanRegions ? addRegionGoals(M, AsanProven, Shadow, Slots, Calls)
+                          : addBoundsGoals(M, AsanProven, Shadow);
+      for (BoundsGoal &G : Goals)
+        GoalCmps.insert(G.Cmps.begin(), G.Cmps.end());
+    }
+    unsigned AsanConstant = AsanProven.size();
     nameValuesForSRA(M);
     std::vector<Instruction *> ById;
     if (AliasFacts || MoreFacts)
       tagAccesses(M, ById);
     std::unique_ptr<Module> C = CloneModule(M);
     runSRA(*C);
+    // Pointer parameters' regions come from a second clone, where they are
+    // passed as integer parameters (wireParamSlots); its verdicts only
+    // decide the -sra-cvp-asan comparisons.
+    if (!Goals.empty() && !Slots.empty()) {
+      ValueToValueMapTy VMap;
+      std::unique_ptr<Module> C2 = CloneModule(M, VMap);
+      wireParamSlots(
+          *C2, [&](Value *V) -> Value * { Value *R = VMap.lookup(V); return R ? R : V; }, Slots,
+          Calls);
+      runSRA(*C2);
+      for (BoundsGoal &G : Goals)
+        for (ICmpInst *Cmp : G.Cmps)
+          if (auto *CC = dyn_cast_or_null<ICmpInst>(VMap.lookup(Cmp)))
+            if (MDNode *MD = CC->getMetadata("srange.cmp");
+                MD && cast<MDString>(MD->getOperand(0))->getString() == "true")
+              GoalTrue.insert(Cmp);
+    }
     unsigned AliasPairs = AliasFacts ? applyAliasFacts(*C, ById) : 0;
     unsigned DeadCases = 0, NoDefault = 0, LShr = 0, Picks = 0;
     if (MoreFacts)
@@ -854,6 +1677,12 @@ struct SRACVPPass : PassInfoMixin<SRACVPPass> {
         }
         if (auto *Cmp = dyn_cast<ICmpInst>(I)) {
           MDNode *MD = CI.getMetadata("srange.cmp");
+          if (GoalCmps.contains(Cmp)) {
+            if (MD && Cmp->getPredicate() == cast<ICmpInst>(CI).getPredicate() &&
+                cast<MDString>(MD->getOperand(0))->getString() == "true")
+              GoalTrue.insert(Cmp);
+            continue;
+          }
           if (FoldCmps && MD &&
               Cmp->getPredicate() == cast<ICmpInst>(CI).getPredicate()) {
             bool V = cast<MDString>(MD->getOperand(0))->getString() == "true";
@@ -991,6 +1820,44 @@ struct SRACVPPass : PassInfoMixin<SRACVPPass> {
         ++(V ? True : False);
       }
     }
+    // In check mode the run-time tests need the real values of the
+    // parameters' regions: the module itself gets the extra parameters.
+    if (AsanSafe == "check" && !Slots.empty()) {
+      SmallVector<Instruction *, 16> Wired;
+      wireParamSlots(M, [](Value *V) { return V; }, Slots, Calls, &Wired);
+      DenseSet<Instruction *> Gone(Wired.begin(), Wired.end());
+      erase_if(Shadow, [&](Instruction *I) { return Gone.contains(I); });
+      // What depends on a placeholder left (an unwired function) has no
+      // value at run time: no proof from it is checked.
+      DenseSet<Value *> Tainted;
+      for (const ParamSlot &S : Slots)
+        for (CallInst *P : {S.Back, S.Fwd})
+          if (!Gone.contains(P))
+            Tainted.insert(P);
+      for (bool Changed = true; Changed;) {
+        Changed = false;
+        for (Instruction *I : Shadow)
+          if (!Tainted.contains(I) &&
+              any_of(I->operands(), [&](Value *Op) { return Tainted.contains(Op); }))
+            Tainted.insert(I), Changed = true;
+      }
+      for (auto It = GoalTrue.begin(); It != GoalTrue.end();) {
+        auto Next = std::next(It);
+        if (Tainted.contains(*It))
+          GoalTrue.erase(It);
+        It = Next;
+      }
+      for (auto &[CB, V] : Calls)
+        for (auto [Bk, Fw] : V)
+          for (Value *X : {Bk, Fw})
+            if (auto *XI = dyn_cast_or_null<Instruction>(X); XI && !Gone.contains(XI))
+              CallArgs.push_back(XI);
+    }
+    unsigned AsanAccesses = AsanConstant + Goals.size();
+    unsigned AsanSafeCount =
+        AsanSafe != "none" ? applyBoundsGoals(Goals, AsanProven, Shadow, GoalTrue, CallArgs) : 0;
+    if (Function *P = M.getFunction("sra.asan.param"); P && P->use_empty())
+      P->eraseFromParent();
     double Secs = std::chrono::duration<double>(
                       std::chrono::steady_clock::now() - Start)
                       .count();
@@ -1006,10 +1873,12 @@ struct SRACVPPass : PassInfoMixin<SRACVPPass> {
            << ", \"fact_arg_attrs\": " << FS.ArgAttrs << ", \"fact_checks\": " << FS.Checks
            << ", \"fact_poison_skipped\": " << FS.PoisonSkipped
            << ", \"fact_already_known\": " << FS.Known
+           << ", \"asan_accesses\": " << AsanAccesses
+           << ", \"asan_constant\": " << AsanConstant << ", \"asan_safe\": " << AsanSafeCount
            << ", \"seconds\": " << format("%.3f", Secs) << "}\n";
     return True + False + NSW + NUW + AliasPairs + SameSign + TruncFlags + NNeg +
                    Unsigned + DivNarrow + DeadCases + NoDefault + LShr + Picks + NoOverflow +
-                   FS.Consts + FS.Bounds + FS.Bits + FS.ArgAttrs + FS.Checks
+                   FS.Consts + FS.Bounds + FS.Bits + FS.ArgAttrs + FS.Checks + AsanSafeCount
                ? PreservedAnalyses::none()
                                     : PreservedAnalyses::all();
   }
