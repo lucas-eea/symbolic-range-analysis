@@ -287,6 +287,9 @@ private:
   DominatorTree &DT;
   /// Sigma nodes of each value, i.e. the places where a branch refines it.
   DenseMap<Value *, SmallVector<PHINode *, 2>> SigmasOf;
+  /// The sigma nodes of a value whose blocks dominate a block, in SigmasOf
+  /// order (symbolBounds asks the same question in every round).
+  DenseMap<std::pair<Value *, BasicBlock *>, SmallVector<PHINode *, 2>> DomSigmas;
   BasicBlock *Ctx = nullptr;
   /// The block of the sigma node being computed. On its incoming edge, the
   /// operands of the branch's comparisons have the ranges of their sigma nodes.
@@ -872,9 +875,12 @@ Solver::Bounds Solver::symbolBounds(Value *V) {
     return B;
   auto Base = [this](Value *X) { return baseBounds(X); };
   Bounds Before = B;
-  for (PHINode *S : It->second) {
-    if (!DT.dominates(S->getParent(), Ctx))
-      continue;
+  auto [D, NewD] = DomSigmas.try_emplace({V, Ctx});
+  if (NewD)
+    for (PHINode *S : It->second)
+      if (DT.dominates(S->getParent(), Ctx))
+        D->second.push_back(S);
+  for (PHINode *S : D->second) {
     if (Reads)
       Reads->push_back(S);
     auto St = State.find(S);
