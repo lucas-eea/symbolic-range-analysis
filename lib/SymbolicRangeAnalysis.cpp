@@ -290,6 +290,14 @@ private:
   /// The sigma nodes of a value whose blocks dominate a block, in SigmasOf
   /// order (symbolBounds asks the same question in every round).
   DenseMap<std::pair<Value *, BasicBlock *>, SmallVector<PHINode *, 2>> DomSigmas;
+  /// The numeric hull of a sigma node's state, with base bounds only, and
+  /// the version of the state it was computed from.
+  struct SigmaHull {
+    unsigned Stamp = 0;
+    std::optional<numeric> Lo, Hi;
+  };
+  DenseMap<PHINode *, SigmaHull> SigmaHulls;
+  const SigmaHull &sigmaHull(PHINode *S, const SR &St);
   BasicBlock *Ctx = nullptr;
   /// The block of the sigma node being computed. On its incoming edge, the
   /// operands of the branch's comparisons have the ranges of their sigma nodes.
@@ -440,6 +448,7 @@ void Solver::solve() {
   State.clear();
   IterCount.clear();
   ChangedAt.clear();
+  SigmaHulls.clear();
   Memos.clear();
   Version = 0;
   enableParamFacts(true);
@@ -873,7 +882,6 @@ Solver::Bounds Solver::symbolBounds(Value *V) {
   // bounds V.
   if (!B)
     return B;
-  auto Base = [this](Value *X) { return baseBounds(X); };
   Bounds Before = B;
   auto [D, NewD] = DomSigmas.try_emplace({V, Ctx});
   if (NewD)
@@ -886,10 +894,11 @@ Solver::Bounds Solver::symbolBounds(Value *V) {
     auto St = State.find(S);
     if (St == State.end() || St->second.isBottom)
       continue;
-    if (auto Lo = symboxes::evaluate(St->second.Lower, Base).Lo)
-      B->first = std::max(B->first, *Lo);
-    if (auto Hi = symboxes::evaluate(St->second.Upper, Base).Hi)
-      B->second = std::min(B->second, *Hi);
+    const SigmaHull &H = sigmaHull(S, St->second);
+    if (H.Lo)
+      B->first = std::max(B->first, *H.Lo);
+    if (H.Hi)
+      B->second = std::min(B->second, *H.Hi);
   }
   // Contradictory facts, such as a parameter that every call passes as 0 inside
   // `if (p != 0)`, mean the block cannot run; use the bounds without facts
@@ -897,6 +906,19 @@ Solver::Bounds Solver::symbolBounds(Value *V) {
   if (B->first > B->second)
     return Before;
   return B;
+}
+
+const Solver::SigmaHull &Solver::sigmaHull(PHINode *S, const SR &St) {
+  unsigned Stamp = ChangedAt.lookup(S);
+  auto [It, New] = SigmaHulls.try_emplace(S);
+  SigmaHull &H = It->second;
+  if (New || H.Stamp != Stamp) {
+    auto Base = [this](Value *X) { return baseBounds(X); };
+    H.Stamp = Stamp;
+    H.Lo = symboxes::evaluate(St.Lower, Base).Lo;
+    H.Hi = symboxes::evaluate(St.Upper, Base).Hi;
+  }
+  return H;
 }
 
 Solver::Bounds Solver::baseBounds(Value *V) {
