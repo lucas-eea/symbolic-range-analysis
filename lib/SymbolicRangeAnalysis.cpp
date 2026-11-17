@@ -592,37 +592,39 @@ SR Solver::widenPhi(PHINode *Phi, const SR &Old, const SR &New) {
       if (!E.isBottom)
         Entries.push_back(E);
     }
-  std::vector<SE> Up, Down;
-  for (Value *T : thresholds(L)) {
-    SR RT = getState(T);
-    if (RT.isBottom)
-      continue;
-    for (int64_t D = -1; D <= 1; ++D) {
-      SE U = SE::add(RT.Upper, SE::num(D)), Lo = SE::add(RT.Lower, SE::num(D));
-      Up.push_back(U);
-      Down.push_back(Lo);
-      for (const SR &E : Entries) {
-        Up.push_back(SE::mkMax(E.Upper, U));
-        Down.push_back(SE::mkMin(E.Lower, Lo));
+  // Calls Fn on each candidate for the upper (Upper) or lower bound, built
+  // only when that bound is infinite.
+  auto Candidates = [&](bool Upper, function_ref<void(const SE &)> Fn) {
+    for (Value *T : thresholds(L)) {
+      SR RT = getState(T);
+      if (RT.isBottom)
+        continue;
+      for (int64_t D = -1; D <= 1; ++D) {
+        SE B = SE::add(Upper ? RT.Upper : RT.Lower, SE::num(D));
+        Fn(B);
+        for (const SR &E : Entries)
+          Fn(Upper ? SE::mkMax(E.Upper, B) : SE::mkMin(E.Lower, B));
       }
     }
-  }
+  };
 
   // The tightest candidates that cover both the old and the new bound. The min
   // (or max) of all valid candidates is valid too.
   SE Hi = W.Upper, Lo = W.Lower;
   if (Hi.kind() == SE::PosInf) {
     SE Best = SE::inf();
-    for (const SE &T : Up)
+    Candidates(true, [&](const SE &T) {
       if (SE::provablyLE(New.Upper, T) && SE::provablyLE(Old.Upper, T))
         Best = SE::mkMin(Best, T);
+    });
     Hi = Best;
   }
   if (Lo.kind() == SE::NegInf) {
     SE Best = SE::negInf();
-    for (const SE &T : Down)
+    Candidates(false, [&](const SE &T) {
       if (SE::provablyLE(T, New.Lower) && SE::provablyLE(T, Old.Lower))
         Best = SE::mkMax(Best, T);
+    });
     Lo = Best;
   }
   return SR::of(Lo, Hi);
