@@ -8,6 +8,7 @@
 #include "SymBoxes.h"
 #include <algorithm>
 #include <sstream>
+#include <climits>
 #include <unordered_map>
 
 using namespace GiNaC;
@@ -655,10 +656,161 @@ SymExpr SymExpr::resolve(const SymExpr &E, bool Upper,
   return N ? fromPoly(*N) : Unbounded;
 }
 
+namespace {
+using I128 = __int128;
+
+/// Largest magnitude evalFast keeps: sums of two such values fit 128 bits
+/// (products are checked), and the result converts back with two 64-bit
+/// pieces.
+constexpr I128 FastLimit = I128(1) << 124;
+
+/// An interval of integers below FastLimit; an absent bound is unbounded.
+struct FastIv {
+  I128 Lo = 0, Hi = 0;
+  bool HasLo = false, HasHi = false;
+};
+
+/// Stores \p N in \p Out if it is an integer that fits 64 bits.
+bool toFast(const numeric &N, I128 &Out) {
+  if (!N.is_integer() || N.int_length() > 63)
+    return false;
+  Out = N.to_long();
+  return true;
+}
+
+/// Stores \p V in \p Out if its magnitude is below FastLimit.
+bool keep(I128 V, I128 &Out) {
+  if (V > FastLimit || V < -FastLimit)
+    return false;
+  Out = V;
+  return true;
+}
+
+numeric toNumeric(I128 V) {
+  if (V >= INT64_MIN && V <= INT64_MAX)
+    return numeric(static_cast<long>(V));
+  // V = Q * 2^62 + R with 0 <= R < 2^62; |Q| < 2^62 since |V| <= 2^124.
+  I128 Q = V >> 62, R = V - (Q << 62);
+  return numeric(static_cast<long>(Q)) * numeric(static_cast<long>(1) << 62) +
+         numeric(static_cast<long>(R));
+}
+
+FastIv fastPoint(I128 N) { return {N, N, true, true}; }
+
+/// evalEx on 128-bit integers: the same intervals, as long as every number
+/// in the expression and every symbol bound is an integer that fits 64 bits
+/// and every intermediate result stays below FastLimit. Clears \p Ok when
+/// one does not, and the caller then uses evalEx.
+FastIv evalFast(const ex &E, SymbolBoundsFn Bounds, bool &Ok) {
+  if (!Ok)
+    return {};
+  if (is_exactly_a<numeric>(E)) {
+    I128 N;
+    if (!toFast(ex_to<numeric>(E), N))
+      return Ok = false, FastIv();
+    return fastPoint(N);
+  }
+  if (is_a<symbol>(E)) {
+    if (llvm::Value *V = ginac_glue::valueFor(E))
+      if (auto B = Bounds(V)) {
+        FastIv R;
+        if (!toFast(B->first, R.Lo) || !toFast(B->second, R.Hi))
+          return Ok = false, FastIv();
+        R.HasLo = R.HasHi = true;
+        return R;
+      }
+    return {};
+  }
+  auto Add = [&](const FastIv &A, const FastIv &B) {
+    FastIv R;
+    if (A.HasLo && B.HasLo)
+      R.HasLo = keep(A.Lo + B.Lo, R.Lo) || (Ok = false);
+    if (A.HasHi && B.HasHi)
+      R.HasHi = keep(A.Hi + B.Hi, R.Hi) || (Ok = false);
+    return R;
+  };
+  auto Mul = [&](const FastIv &A, const FastIv &B) {
+    auto IsZero = [](const FastIv &X) { return X.HasLo && X.HasHi && !X.Lo && !X.Hi; };
+    if (IsZero(A) || IsZero(B))
+      return fastPoint(0);
+    if (!A.HasLo || !A.HasHi || !B.HasLo || !B.HasHi)
+      return FastIv();
+    I128 C[4];
+    if (__builtin_mul_overflow(A.Lo, B.Lo, &C[0]) || __builtin_mul_overflow(A.Lo, B.Hi, &C[1]) ||
+        __builtin_mul_overflow(A.Hi, B.Lo, &C[2]) || __builtin_mul_overflow(A.Hi, B.Hi, &C[3])) {
+      Ok = false;
+      return FastIv();
+    }
+    FastIv R;
+    R.HasLo = keep(*std::min_element(std::begin(C), std::end(C)), R.Lo) || (Ok = false);
+    R.HasHi = keep(*std::max_element(std::begin(C), std::end(C)), R.Hi) || (Ok = false);
+    return R;
+  };
+  if (is_a<add>(E)) {
+    FastIv R = fastPoint(0);
+    for (size_t I = 0; I < E.nops() && Ok; ++I)
+      R = Add(R, evalFast(E.op(I), Bounds, Ok));
+    return R;
+  }
+  if (is_a<mul>(E)) {
+    FastIv R = fastPoint(1);
+    for (size_t I = 0; I < E.nops() && Ok; ++I)
+      R = Mul(R, evalFast(E.op(I), Bounds, Ok));
+    return R;
+  }
+  if (is_a<power>(E) && is_exactly_a<numeric>(E.op(1))) {
+    const numeric &K = ex_to<numeric>(E.op(1));
+    if (K.is_pos_integer() && K <= 16) {
+      FastIv Base = evalFast(E.op(0), Bounds, Ok), R = fastPoint(1);
+      for (long I = 0; I < K.to_long() && Ok; ++I)
+        R = Mul(R, Base);
+      return R;
+    }
+    return {};
+  }
+  if (is_a<function>(E) &&
+      ex_to<function>(E).get_serial() == ginac_glue::idiv_SERIAL::serial &&
+      is_exactly_a<numeric>(E.op(1))) {
+    const numeric &DN = ex_to<numeric>(E.op(1));
+    if (DN.is_zero() || !DN.is_integer())
+      return {};
+    I128 D;
+    if (!toFast(DN, D))
+      return Ok = false, FastIv();
+    FastIv N = evalFast(E.op(0), Bounds, Ok);
+    // Truncating division, like iquo; it only shrinks magnitudes.
+    FastIv R;
+    if (D > 0) {
+      R.HasLo = N.HasLo, R.Lo = N.Lo / D;
+      R.HasHi = N.HasHi, R.Hi = N.Hi / D;
+    } else {
+      R.HasLo = N.HasHi, R.Lo = N.Hi / D;
+      R.HasHi = N.HasLo, R.Hi = N.Lo / D;
+    }
+    return R;
+  }
+  return {};
+}
+} // namespace
+
+/// evalEx, through evalFast when the numbers fit.
+static NumInterval evalExFast(const ex &E, SymbolBoundsFn Bounds) {
+  bool Ok = true;
+  FastIv F = evalFast(E, Bounds, Ok);
+  if (!Ok)
+    return evalEx(E, Bounds);
+  NumInterval R;
+  if (F.HasLo)
+    R.Lo = toNumeric(F.Lo);
+  if (F.HasHi)
+    R.Hi = toNumeric(F.Hi);
+  return R;
+}
+
 NumInterval evaluate(const SymExpr &E, SymbolBoundsFn Bounds) {
   switch (E.kind()) {
   case SymExpr::Poly:
-    return evalEx(E.poly(), Bounds);
+    return evalExFast(E.poly(), Bounds);
   case SymExpr::Min:
   case SymExpr::Max: {
     bool IsMin = E.kind() == SymExpr::Min;
