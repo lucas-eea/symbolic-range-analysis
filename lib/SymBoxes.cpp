@@ -310,6 +310,63 @@ bool SymExpr::provablyLE(const SymExpr &A, const SymExpr &B) {
   return false;
 }
 
+/// A key for \p E that does not depend on GiNaC's term order. GiNaC orders
+/// the terms of sums and products by hashes seeded with the addresses of
+/// type names, which change from run to run; this key sorts them by their
+/// own keys instead, so it orders expressions the same way in every run.
+static std::string canonKey(const ex &E) {
+  if (is_a<symbol>(E))
+    return "s:" + ex_to<symbol>(E).get_name();
+  if (is_exactly_a<numeric>(E)) {
+    std::ostringstream OS;
+    OS << E;
+    return "n:" + OS.str();
+  }
+  std::vector<std::string> Ops;
+  for (size_t I = 0; I < E.nops(); ++I)
+    Ops.push_back(canonKey(E.op(I)));
+  if (is_a<add>(E) || is_a<mul>(E))
+    std::sort(Ops.begin(), Ops.end());
+  std::string R = is_a<add>(E) ? "+(" : is_a<mul>(E) ? "*(" : is_a<power>(E) ? "^(" : "f(";
+  if (is_a<function>(E))
+    R += ex_to<function>(E).get_name() + ",";
+  for (const std::string &O : Ops)
+    R += O + ",";
+  return R + ")";
+}
+
+static std::string canonKey(const SymExpr &E) {
+  switch (E.kind()) {
+  case SymExpr::Poly:
+    return canonKey(E.poly());
+  case SymExpr::Min:
+  case SymExpr::Max: {
+    std::vector<std::string> Args;
+    for (const SymExpr &X : E.args())
+      Args.push_back(canonKey(X));
+    std::sort(Args.begin(), Args.end());
+    std::string R = E.kind() == SymExpr::Min ? "min(" : "max(";
+    for (const std::string &A : Args)
+      R += A + ",";
+    return R + ")";
+  }
+  default:
+    return "k" + std::to_string(int(E.kind()));
+  }
+}
+
+/// Of two arguments of a min or max that bound each other (equal where the
+/// expression is built), returns true if \p A is the one to keep: a
+/// constant, else the smaller expression, else the first by canonKey. The
+/// choice must not depend on the arguments' order, which follows GiNaC's.
+static bool keepFirst(const SymExpr &A, const SymExpr &B) {
+  if (A.isConst() != B.isConst())
+    return A.isConst();
+  if (A.size() != B.size())
+    return A.size() < B.size();
+  return canonKey(A) < canonKey(B);
+}
+
 SymExpr SymExpr::minMax(Kind K, std::vector<SymExpr> In) {
   assert(K == Min || K == Max);
   // Flatten nested min/max of the same kind; fold infinities.
@@ -334,10 +391,17 @@ SymExpr SymExpr::minMax(Kind K, std::vector<SymExpr> In) {
   auto Dominates = [K](const SymExpr &X, const SymExpr &Y) {
     return K == Min ? provablyLE(X, Y) : provablyLE(Y, X);
   };
+  // Two arguments that dominate each other are equal there: keep the one
+  // keepFirst prefers, whatever their order.
   std::vector<SymExpr> Kept;
   for (SymExpr &E : Flat) {
-    if (std::any_of(Kept.begin(), Kept.end(),
-                    [&](const SymExpr &O) { return Dominates(O, E); }))
+    bool Drop = false;
+    for (const SymExpr &O : Kept)
+      if (Dominates(O, E) && (!Dominates(E, O) || O == E || keepFirst(O, E))) {
+        Drop = true;
+        break;
+      }
+    if (Drop)
       continue;
     Kept.erase(std::remove_if(Kept.begin(), Kept.end(),
                               [&](const SymExpr &O) { return Dominates(E, O); }),
