@@ -986,13 +986,21 @@ static void wireParamSlots(Module &C, function_ref<Value *(Value *)> Map,
         Args.push_back(Bk ? Get(Bk) : Unknown());
         Args.push_back(Fw ? Get(Fw) : Unknown());
       }
-      // An invoke stays an invoke: it ends its block.
+      // An invoke stays an invoke: it ends its block. The new call keeps the
+      // old one's bundles, calling convention and attributes (byval, sret,
+      // ...), which the callee's parameters still expect.
+      SmallVector<OperandBundleDef, 1> Bundles;
+      CB->getOperandBundlesAsDefs(Bundles);
       CallBase *NC;
       if (auto *II = dyn_cast<InvokeInst>(CB))
-        NC = InvokeInst::Create(NF, II->getNormalDest(), II->getUnwindDest(), Args, "",
-                                CB->getIterator());
+        NC = InvokeInst::Create(NF, II->getNormalDest(), II->getUnwindDest(), Args, Bundles,
+                                "", CB->getIterator());
       else
-        NC = CallInst::Create(NF, Args, "", CB->getIterator());
+        NC = CallInst::Create(NF, Args, Bundles, "", CB->getIterator());
+      NC->setCallingConv(CB->getCallingConv());
+      NC->setAttributes(CB->getAttributes());
+      if (auto *CI = dyn_cast<CallInst>(CB))
+        cast<CallInst>(NC)->setTailCallKind(CI->getTailCallKind());
       NC->setDebugLoc(CB->getDebugLoc());
       NC->takeName(CB);
       CB->replaceAllUsesWith(NC);
