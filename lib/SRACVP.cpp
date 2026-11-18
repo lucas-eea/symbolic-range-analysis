@@ -820,8 +820,10 @@ private:
       return B.CreateMul(B.CreateZExtOrTrunc(AI->getArraySize(), I64, "sra.size"),
                          ConstantInt::get(I64, Elem), "sra.size", /*HasNUW=*/true);
     }
+    // Before the call: the size only reads its arguments, and an invoke
+    // has no instruction after it in its block.
     auto *CB = cast<CallBase>(O);
-    ShadowBuilder B(CB->getNextNode(), Shadow);
+    ShadowBuilder B(CB, Shadow);
     StringRef Name = CB->getCalledFunction()->getName();
     auto Arg = [&](unsigned K) {
       return B.CreateZExtOrTrunc(CB->getArgOperand(K), I64, "sra.size");
@@ -941,7 +943,8 @@ static void wireParamSlots(Module &C, function_ref<Value *(Value *)> Map,
       F->setLinkage(GlobalValue::InternalLinkage);
     bool Direct = all_of(F->uses(), [&](const Use &U) {
       auto *CB = dyn_cast<CallBase>(U.getUser());
-      return CB && CB->isCallee(&U) && CallOf.contains(CB);
+      return CB && (isa<CallInst>(CB) || isa<InvokeInst>(CB)) && CB->isCallee(&U) &&
+             CallOf.contains(CB);
     });
     if (!F->hasLocalLinkage() || !Direct || F->use_empty())
       continue;
@@ -983,7 +986,13 @@ static void wireParamSlots(Module &C, function_ref<Value *(Value *)> Map,
         Args.push_back(Bk ? Get(Bk) : Unknown());
         Args.push_back(Fw ? Get(Fw) : Unknown());
       }
-      auto *NC = CallInst::Create(NF, Args, "", CB->getIterator());
+      // An invoke stays an invoke: it ends its block.
+      CallBase *NC;
+      if (auto *II = dyn_cast<InvokeInst>(CB))
+        NC = InvokeInst::Create(NF, II->getNormalDest(), II->getUnwindDest(), Args, "",
+                                CB->getIterator());
+      else
+        NC = CallInst::Create(NF, Args, "", CB->getIterator());
       NC->setDebugLoc(CB->getDebugLoc());
       NC->takeName(CB);
       CB->replaceAllUsesWith(NC);
