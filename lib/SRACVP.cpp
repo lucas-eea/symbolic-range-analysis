@@ -1844,19 +1844,27 @@ struct SRACVPPass : PassInfoMixin<SRACVPPass> {
       wireParamSlots(M, [](Value *V) { return V; }, Slots, Calls, &Wired);
       DenseSet<Instruction *> Gone(Wired.begin(), Wired.end());
       erase_if(Shadow, [&](Instruction *I) { return Gone.contains(I); });
-      // What depends on a placeholder left (an unwired function) has no
-      // value at run time: no proof from it is checked.
+      // What depends on a placeholder left (the regions of an unwired
+      // function, or an unknown region passed at a call site) has no value at
+      // run time: no proof from it is checked. A region passed to a wired
+      // function carries this to the function's region parameter.
       DenseSet<Value *> Tainted;
-      for (const ParamSlot &S : Slots)
-        for (CallInst *P : {S.Back, S.Fwd})
-          if (!Gone.contains(P))
-            Tainted.insert(P);
+      if (Function *P = M.getFunction("sra.asan.param"))
+        for (User *U : P->users())
+          Tainted.insert(U);
       for (bool Changed = true; Changed;) {
         Changed = false;
         for (Instruction *I : Shadow)
           if (!Tainted.contains(I) &&
               any_of(I->operands(), [&](Value *Op) { return Tainted.contains(Op); }))
             Tainted.insert(I), Changed = true;
+        for (Function &F : M)
+          for (Instruction &I : instructions(F))
+            if (auto *CB = dyn_cast<CallBase>(&I))
+              if (Function *Callee = CB->getCalledFunction(); Callee && !Callee->isDeclaration())
+                for (unsigned K = 0, E = std::min<unsigned>(CB->arg_size(), Callee->arg_size()); K < E; ++K)
+                  if (Tainted.contains(CB->getArgOperand(K)) && Tainted.insert(Callee->getArg(K)).second)
+                    Changed = true;
       }
       for (auto It = GoalTrue.begin(); It != GoalTrue.end();) {
         auto Next = std::next(It);
@@ -1873,6 +1881,14 @@ struct SRACVPPass : PassInfoMixin<SRACVPPass> {
     unsigned AsanAccesses = AsanConstant + Goals.size();
     unsigned AsanSafeCount =
         AsanSafe != "none" ? applyBoundsGoals(Goals, AsanProven, Shadow, GoalTrue, CallArgs) : 0;
+    // In check mode, the placeholders still read have no definition to link
+    // against; nothing checked depends on them, so any value will do.
+    if (Function *P = M.getFunction("sra.asan.param"); P && AsanSafe == "check")
+      for (User *U : make_early_inc_range(P->users()))
+        if (auto *CI = dyn_cast<CallInst>(U)) {
+          CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), 0));
+          CI->eraseFromParent();
+        }
     if (Function *P = M.getFunction("sra.asan.param"); P && P->use_empty())
       P->eraseFromParent();
     double Secs = std::chrono::duration<double>(
