@@ -2011,7 +2011,8 @@ void Solver::annotateSigns(Instruction &I) {
     if (Bits && Bits < I.getType()->getIntegerBitWidth())
       Mark("srange.divbits", std::to_string(Bits));
   }
-  if (auto *T = dyn_cast<TruncInst>(&I)) {
+  // Vector truncs (after the vectorizer) have no range.
+  if (auto *T = dyn_cast<TruncInst>(&I); T && T->getType()->isIntegerTy()) {
     SR R = getState(T->getOperand(0));
     if (!R.isBottom) {
       bool NSW = fitsType(R, T->getType());
