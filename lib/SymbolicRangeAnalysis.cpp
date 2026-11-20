@@ -67,6 +67,10 @@ static cl::opt<bool> UseMemoOpt(
     "sra-memo", cl::init(true), cl::Hidden,
     cl::desc("Memoize symbolic sums and differences"),
     cl::cb<void, bool>([](bool B) { symboxes::UseMemo = B; }));
+static cl::opt<bool> UseLEMemoOpt(
+    "sra-memo-le", cl::init(true), cl::Hidden,
+    cl::desc("Memoize symbolic comparisons within each top-level comparison"),
+    cl::cb<void, bool>([](bool B) { symboxes::UseLEMemo = B; }));
 static cl::opt<bool> AliasFacts(
     "sra-alias", cl::init(false),
     cl::desc("Annotate pairs of memory accesses whose byte ranges are "

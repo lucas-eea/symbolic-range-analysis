@@ -37,6 +37,11 @@ namespace symboxes {
 /// Memoizes GiNaC sums and differences. The results are the same either way.
 extern bool UseMemo;
 
+/// Memoizes SymExpr::provablyLE within each top-level call: a nested min/max
+/// asks the same comparison of its arguments many times. Nothing it depends
+/// on changes during a call, so the results are the same either way.
+extern bool UseLEMemo;
+
 /// A symbolic expression: a polynomial over LLVM values, an n-ary min or max
 /// of expressions, +inf, -inf, or Top (unknown).
 class SymExpr {
@@ -110,6 +115,8 @@ private:
   static SymExpr fromPoly(const GiNaC::ex &E);
   static SymExpr minMax(Kind K, std::vector<SymExpr> In);
   static SymExpr scale(const SymExpr &E, const GiNaC::numeric &C);
+  /// provablyLE without the memo (see UseLEMemo).
+  static bool provablyLEImpl(const SymExpr &A, const SymExpr &B);
 
   Kind K;
   GiNaC::ex P; ///< Poly: an expanded polynomial with integer coefficients.

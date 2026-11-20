@@ -253,7 +253,59 @@ SymExpr SymExpr::div(const SymExpr &A, const SymExpr &B) {
   llvm_unreachable("covered switch");
 }
 
+bool UseLEMemo = true;
+
+namespace {
+/// A structural hash of \p E: equal expressions (operator==) hash alike.
+size_t hashOf(const SymExpr &E) {
+  size_t H = size_t(E.kind()) * 0x9e3779b97f4a7c15ULL;
+  if (E.kind() == SymExpr::Poly)
+    return H ^ E.poly().gethash();
+  if (E.kind() == SymExpr::Min || E.kind() == SymExpr::Max)
+    for (const SymExpr &X : E.args())
+      H = (H ^ hashOf(X)) * 0x100000001b3ULL;
+  return H;
+}
+
+/// One comparison asked during a top-level call: A <= B at fact depth Depth.
+struct LEKey {
+  SymExpr A, B;
+  unsigned Depth;
+  bool operator==(const LEKey &O) const {
+    return Depth == O.Depth && A == O.A && B == O.B;
+  }
+};
+struct LEKeyHash {
+  size_t operator()(const LEKey &K) const {
+    return (hashOf(K.A) * 31 + hashOf(K.B)) * 31 + K.Depth;
+  }
+};
+/// The answers of the current top-level call (null outside one).
+std::unordered_map<LEKey, bool, LEKeyHash> *LEMemo = nullptr;
+} // namespace
+
 bool SymExpr::provablyLE(const SymExpr &A, const SymExpr &B) {
+  // The trivial cases are cheaper than a lookup.
+  if (!UseLEMemo || A.K == Top || B.K == Top || A.K == NegInf || A.K == PosInf ||
+      B.K == NegInf || B.K == PosInf)
+    return provablyLEImpl(A, B);
+  if (!LEMemo) { // A top-level call: its answers are kept until it returns.
+    std::unordered_map<LEKey, bool, LEKeyHash> M;
+    LEMemo = &M;
+    bool R = provablyLEImpl(A, B);
+    LEMemo = nullptr;
+    return R;
+  }
+  LEKey K{A, B, FactDepth};
+  auto It = LEMemo->find(K);
+  if (It != LEMemo->end())
+    return It->second;
+  bool R = provablyLEImpl(A, B);
+  LEMemo->emplace(std::move(K), R);
+  return R;
+}
+
+bool SymExpr::provablyLEImpl(const SymExpr &A, const SymExpr &B) {
   if (A.K == Top || B.K == Top)
     return false;
   if (A.K == NegInf || B.K == PosInf)
