@@ -25,7 +25,7 @@ namespace llvm {
 /// Annotates each instruction with !srange metadata encoding its symbolic
 /// integer range, computed by fixpoint iteration over a symbolic interval
 /// domain.
-struct SymbolicRangeAnalysis : public PassInfoMixin<SymbolicRangeAnalysis> {
+struct SymbolicRangeAnalysis : public OptionalPassInfoMixin<SymbolicRangeAnalysis> {
   /// Maps argument names to concrete [lo, hi] bounds supplied by the user.
   using ArgRangeMap = std::map<std::string, std::pair<int64_t, int64_t>>;
 

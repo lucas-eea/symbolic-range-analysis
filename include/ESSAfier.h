@@ -22,7 +22,7 @@ namespace llvm {
 /// renamed to the sigma node, so each side of the branch has its own name for
 /// the value. In `if (x < N)`, for example, the true side's copy of `x` is
 /// known to be less than `N`.
-struct ESSAfier : public PassInfoMixin<ESSAfier> {
+struct ESSAfier : public OptionalPassInfoMixin<ESSAfier> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 };
 

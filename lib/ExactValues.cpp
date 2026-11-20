@@ -429,8 +429,8 @@ bool ExactValues::deriveLoopFacts() {
       Loop *L = LI.getLoopFor(Hd);
       if (!L || L->getHeader() != Hd || L->contains(&BB))
         continue;
-      auto *Br = dyn_cast<BranchInst>(Hd->getTerminator());
-      auto *Cmp = Br && Br->isConditional() ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
+      auto *Br = dyn_cast<CondBrInst>(Hd->getTerminator());
+      auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
       if (!Cmp)
         continue;
       auto *P = dyn_cast<PHINode>(throughSigmas(Sigma.getIncomingValue(0)));

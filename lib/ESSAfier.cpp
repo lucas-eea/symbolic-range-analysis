@@ -267,8 +267,7 @@ PreservedAnalyses ESSAfier::run(Function &F, FunctionAnalysisManager &FAM) {
   if (SplitCriticalEdges) {
     SmallVector<std::pair<Instruction *, unsigned>, 16> Edges;
     for (BasicBlock &BB : F)
-      if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
-        if (BI->isConditional()) {
+      if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator())) {
           SmallVector<ICmpInst *, 4> Cmps;
           collectComparisons(BI->getCondition(), Cmps);
           if (Cmps.empty())
@@ -282,8 +281,8 @@ PreservedAnalyses ESSAfier::run(Function &F, FunctionAnalysisManager &FAM) {
   }
 
   for (BasicBlock &BB : F) {
-    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-    if (!BI || !BI->isConditional())
+    auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+    if (!BI)
       continue;
 
     SmallVector<ICmpInst *, 4> Cmps;

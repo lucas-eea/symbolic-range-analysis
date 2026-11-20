@@ -157,7 +157,7 @@ static void runSRA(Module &C) {
     std::vector<PassPlugin> Ps;
     for (const char *Name : {"ESSAfier.so", "SymbolicRanges.so"}) {
       std::string Path = SRADir + "/" + Name;
-      auto P = PassPlugin::Load(Path);
+      auto P = PassPlugin::load(Path);
       if (!P)
         report_fatal_error(Twine("sra-cvp: cannot load ") + Path + ": " +
                            toString(P.takeError()));
@@ -165,7 +165,7 @@ static void runSRA(Module &C) {
     }
     return Ps;
   }();
-  PassBuilder PB;
+  PassBuilder PB(C.getContext());
   for (PassPlugin &P : Plugins)
     P.registerPassBuilderCallbacks(PB);
   LoopAnalysisManager LAM;
@@ -1438,7 +1438,8 @@ void applyFacts(Function &F, Function &CF,
       continue;
     unsigned N = IT->getBitWidth();
     KnownBits LKB = computeKnownBits(I, DL, &AC, I, &DT);
-    ConstantRange LCR = computeConstantRange(I, /*ForSigned=*/true, true, &AC, I, &DT);
+    ConstantRange LCR = computeConstantRange(
+        I, /*ForSigned=*/true, SimplifyQuery(DL, &DT, &AC, I, /*UseInstrInfo=*/true));
     LCR = LCR.intersectWith(LVI.getConstantRange(I, I, /*UndefAllowed=*/false),
                             ConstantRange::Signed);
     if (SE.isSCEVable(I->getType())) {
@@ -1574,7 +1575,7 @@ void applyFacts(Function &F, Function &CF,
 }
 
 /// The `sra-cvp` module pass.
-struct SRACVPPass : PassInfoMixin<SRACVPPass> {
+struct SRACVPPass : OptionalPassInfoMixin<SRACVPPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
     FactStats FS;
@@ -1947,7 +1948,7 @@ namespace {
 
 /// Removes the llvm.assume calls tagged !sra.fact and the conditions only
 /// they use.
-struct DropSRAAssumes : PassInfoMixin<DropSRAAssumes> {
+struct DropSRAAssumes : OptionalPassInfoMixin<DropSRAAssumes> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
     SmallVector<CallInst *> Dead;
     for (Instruction &I : instructions(F))
@@ -1965,7 +1966,7 @@ struct DropSRAAssumes : PassInfoMixin<DropSRAAssumes> {
 
 /// Runs a function pipeline only in the functions sra-cvp may rewrite
 /// (-sra-cvp-only).
-struct OnlyAllowed : PassInfoMixin<OnlyAllowed> {
+struct OnlyAllowed : OptionalPassInfoMixin<OnlyAllowed> {
   explicit OnlyAllowed(FunctionPassManager FPM) : FPM(std::move(FPM)) {}
   FunctionPassManager FPM;
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {

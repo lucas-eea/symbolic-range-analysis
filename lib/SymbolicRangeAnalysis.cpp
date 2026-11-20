@@ -47,6 +47,26 @@
 #include <sstream>
 
 using namespace llvm;
+
+/// Returns true if \p I has the \c nsw flag. Instructions that cannot carry
+/// it (e.g. \c and, \c udiv) have none; Instruction::hasNoSignedWrap only
+/// accepts instructions that can carry it.
+static bool hasNSW(const Value *I) {
+  if (auto *O = dyn_cast<OverflowingBinaryOperator>(I))
+    return O->hasNoSignedWrap();
+  if (auto *T = dyn_cast<TruncInst>(I))
+    return T->hasNoSignedWrap();
+  return false;
+}
+
+/// Returns true if \p I has the \c nuw flag (see hasNSW).
+static bool hasNUW(const Value *I) {
+  if (auto *O = dyn_cast<OverflowingBinaryOperator>(I))
+    return O->hasNoUnsignedWrap();
+  if (auto *T = dyn_cast<TruncInst>(I))
+    return T->hasNoUnsignedWrap();
+  return false;
+}
 using GiNaC::numeric;
 using SE = symboxes::SymExpr;
 using SR = symboxes::SymRange;
@@ -396,7 +416,7 @@ void Solver::enableParamFacts(bool On) {
 void Solver::summarizeCalls(SummaryMap &Summaries,
                             const DenseSet<Function *> &Eligible) {
   enableParamFacts(true);
-  auto Off = make_scope_exit([this] { enableParamFacts(false); });
+  auto Off = scope_exit([this] { enableParamFacts(false); });
   for (Instruction &I : instructions(F)) {
     auto *CB = dyn_cast<CallBase>(&I);
     Function *G = CB ? CB->getCalledFunction() : nullptr;
@@ -456,7 +476,7 @@ void Solver::solve() {
   Memos.clear();
   Version = 0;
   enableParamFacts(true);
-  auto Off = make_scope_exit([this] { enableParamFacts(false); });
+  auto Off = scope_exit([this] { enableParamFacts(false); });
   for (Argument &Arg : F.args()) {
     auto It = ArgRanges.find(Arg.getName().str());
     if (It != ArgRanges.end())
@@ -666,7 +686,7 @@ std::optional<SE> Solver::strideBodyMax(PHINode *Phi) {
   auto *Next =
       dyn_cast<BinaryOperator>(throughSigmas(Phi->getIncomingValue(Back)));
   if (!Next || Next->getOpcode() != Instruction::Add ||
-      !Next->hasNoSignedWrap())
+      !hasNSW(Next))
     return std::nullopt;
   auto *C = dyn_cast<ConstantInt>(Next->getOperand(1));
   if (!C || throughSigmas(Next->getOperand(0)) != Phi ||
@@ -681,8 +701,8 @@ std::optional<SE> Solver::strideBodyMax(PHINode *Phi) {
   bool ExactInit = RI.Lower == RI.Upper;
   // The test at the top of the loop, on the phi itself: the body only runs
   // for values that pass it.
-  auto *Br = dyn_cast<BranchInst>(Phi->getParent()->getTerminator());
-  if (!Br || !Br->isConditional())
+  auto *Br = dyn_cast<CondBrInst>(Phi->getParent()->getTerminator());
+  if (!Br)
     return std::nullopt;
   auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
   if (!Cmp)
@@ -714,7 +734,7 @@ std::optional<SE> Solver::strideBodyMax(PHINode *Phi) {
     while (auto *Cast = dyn_cast<SExtInst>(B))
       B = Cast->getOperand(0);
     if (auto *Add = dyn_cast<BinaryOperator>(B))
-      if (Add->getOpcode() == Instruction::Add && Add->hasNoSignedWrap())
+      if (Add->getOpcode() == Instruction::Add && hasNSW(Add))
         if (auto *K = dyn_cast<ConstantInt>(Add->getOperand(1)))
           if (throughSigmas(Add->getOperand(0)) == throughSigmas(Init) &&
               K->getBitWidth() <= 64)
@@ -770,8 +790,8 @@ std::optional<SR> Solver::loopBound(PHINode *Phi) {
   if (!Next || (Next->getOpcode() != Instruction::Add &&
                 Next->getOpcode() != Instruction::Sub))
     return std::nullopt;
-  bool NUWOnly = !Next->hasNoSignedWrap() && Next->hasNoUnsignedWrap();
-  if (!Next->hasNoSignedWrap() && !NUWOnly)
+  bool NUWOnly = !hasNSW(Next) && hasNUW(Next);
+  if (!hasNSW(Next) && !NUWOnly)
     return std::nullopt;
   auto *C = dyn_cast<ConstantInt>(Next->getOperand(1));
   if (!C || throughSigmas(Next->getOperand(0)) != Phi ||
@@ -794,14 +814,13 @@ std::optional<SR> Solver::loopBound(PHINode *Phi) {
   BasicBlock *Latch = Phi->getIncomingBlock(Back);
   SmallVector<BasicBlock *, 3> Tests = {Phi->getParent(), Latch};
   if (BasicBlock *Pred = Latch->getSinglePredecessor())
-    if (L->contains(Pred) && isa<BranchInst>(Latch->getTerminator()) &&
-        !cast<BranchInst>(Latch->getTerminator())->isConditional())
+    if (L->contains(Pred) && isa<UncondBrInst>(Latch->getTerminator()))
       Tests.push_back(Pred);
 
   std::optional<SR> Result;
   for (BasicBlock *TestBB : Tests) {
-    auto *Br = dyn_cast<BranchInst>(TestBB->getTerminator());
-    if (!Br || !Br->isConditional())
+    auto *Br = dyn_cast<CondBrInst>(TestBB->getTerminator());
+    if (!Br)
       continue;
     auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
     if (!Cmp)
@@ -1294,8 +1313,8 @@ std::optional<SR> Solver::onEdge(Value *V, unsigned Depth) {
   if (!SigmaBlock)
     return std::nullopt;
   BasicBlock *Pred = SigmaBlock->getSinglePredecessor();
-  auto *Br = Pred ? dyn_cast<BranchInst>(Pred->getTerminator()) : nullptr;
-  if (!Br || !Br->isConditional())
+  auto *Br = Pred ? dyn_cast<CondBrInst>(Pred->getTerminator()) : nullptr;
+  if (!Br)
     return std::nullopt;
   SR R = getState(V);
   if (R.isBottom)
@@ -1328,7 +1347,7 @@ std::optional<SR> Solver::onEdge(Value *V, unsigned Depth) {
         SR C = binaryOp(*Bin, SA ? *SA : getState(Bin->getOperand(0)),
                         SB ? *SB : getState(Bin->getOperand(1)));
         if (!C.isBottom &&
-            (Bin->hasNoSignedWrap() || fitsType(C, Bin->getType()))) {
+            (hasNSW(Bin) || fitsType(C, Bin->getType()))) {
           R = SR::of(SE::mkMax(R.Lower, C.Lower), SE::mkMin(R.Upper, C.Upper));
           Touched = true;
         }
@@ -1498,13 +1517,13 @@ SR Solver::transfer(Instruction &I) {
       // facts, so that simplifying with a fact cannot erase the fact itself.
       BasicBlock *Saved = Ctx;
       setContext(nullptr);
-      auto Restore = make_scope_exit([&] { setContext(Saved); });
+      auto Restore = scope_exit([&] { setContext(Saved); });
       bool IsTrueSide = cast<MDString>(MD->getOperand(0))->getString() == ".t";
       Value *Incoming = Phi->getIncomingValue(0);
       BasicBlock *PredBB = Phi->getIncomingBlock(0);
       SR R = getState(Incoming);
       SigmaBlock = Phi->getParent();
-      auto ResetSigma = make_scope_exit([&] { SigmaBlock = nullptr; });
+      auto ResetSigma = scope_exit([&] { SigmaBlock = nullptr; });
       // A value computed from operands that the branch also tests is evaluated
       // again from their ranges on this edge (the splitting of dependences of
       // OOPSLA'14, Section 4.1). An operation without nsw counts only if it
@@ -1516,12 +1535,12 @@ SR Solver::transfer(Instruction &I) {
           SR C = binaryOp(*Bin, SA ? *SA : getState(Bin->getOperand(0)),
                           SB ? *SB : getState(Bin->getOperand(1)));
           if (!C.isBottom && !R.isBottom &&
-              (Bin->hasNoSignedWrap() || fitsType(C, Bin->getType())))
+              (hasNSW(Bin) || fitsType(C, Bin->getType())))
             R = SR::of(SE::mkMax(R.Lower, C.Lower), SE::mkMin(R.Upper, C.Upper));
         }
       }
-      auto *Br = dyn_cast<BranchInst>(PredBB->getTerminator());
-      if (!Br || !Br->isConditional() || R.isBottom)
+      auto *Br = dyn_cast<CondBrInst>(PredBB->getTerminator());
+      if (!Br || R.isBottom)
         return R;
       SmallVector<std::pair<ICmpInst *, bool>, 4> Cmps;
       impliedComparisons(Br->getCondition(), IsTrueSide, Cmps);
@@ -1628,7 +1647,7 @@ void Solver::run() {
     SmallVector<Instruction *, 8> New;
     for (Instruction &I : instructions(F))
       if (auto *Bin = dyn_cast<OverflowingBinaryOperator>(&I))
-        if (!Bin->hasNoSignedWrap() && !Wrapping.count(&I)) {
+        if (!hasNSW(Bin) && !Wrapping.count(&I)) {
           auto It = State.find(&I);
           if (It != State.end() && !fitsType(It->second, I.getType()))
             New.push_back(&I);
@@ -1638,7 +1657,7 @@ void Solver::run() {
     if (Attempt >= 3) {
       for (Instruction &I : instructions(F))
         if (auto *Bin = dyn_cast<OverflowingBinaryOperator>(&I))
-          if (!Bin->hasNoSignedWrap())
+          if (!hasNSW(Bin))
             Wrapping.insert(&I);
     } else {
       Wrapping.insert(New.begin(), New.end());
@@ -1736,16 +1755,16 @@ void Solver::annotateNoWrap(Instruction &I) {
   Type *Ty = I.getType();
   // The range is that of the mathematical result: if it fits the type, the
   // operation does not wrap (signed).
-  bool NSW = Op->hasNoSignedWrap() || fitsType(It->second, Ty);
+  bool NSW = hasNSW(Op) || fitsType(It->second, Ty);
   if (!NSW)
     return;
   SR A = getState(I.getOperand(0)), B = getState(I.getOperand(1));
   // Non-negative operands and no signed wrap: add and mul do not wrap
   // unsigned either; sub neither if the result is non-negative.
-  bool NUW = !Op->hasNoUnsignedWrap() && nonNeg(A, Ty) && nonNeg(B, Ty) &&
+  bool NUW = !hasNUW(Op) && nonNeg(A, Ty) && nonNeg(B, Ty) &&
              (Opc != Instruction::Sub || nonNeg(It->second, Ty));
   LLVMContext &Ctx = I.getContext();
-  if (!Op->hasNoSignedWrap())
+  if (!hasNSW(Op))
     I.setMetadata("srange.nsw", MDNode::get(Ctx, {}));
   if (NUW)
     I.setMetadata("srange.nuw", MDNode::get(Ctx, {}));
