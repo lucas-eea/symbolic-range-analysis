@@ -664,7 +664,13 @@ private:
   struct Objs {
     SmallSetVector<Value *, 4> Set;
     bool Unknown = false;
-    bool operator!=(const Objs &O) const { return Unknown != O.Unknown || Set != O.Set; }
+    /// Compares the objects, not their order: pointers swapped in a loop
+    /// reach the same objects in alternating orders, and an order-sensitive
+    /// test would never let the fixpoint end.
+    bool operator!=(const Objs &O) const {
+      return Unknown != O.Unknown || Set.size() != O.Set.size() ||
+             any_of(Set, [&](Value *X) { return !O.Set.contains(X); });
+    }
   };
 
   const DataLayout &DL;
