@@ -946,7 +946,10 @@ static void wireParamSlots(Module &C, function_ref<Value *(Value *)> Map,
       return CB && (isa<CallInst>(CB) || isa<InvokeInst>(CB)) && CB->isCallee(&U) &&
              CallOf.contains(CB);
     });
-    if (!F->hasLocalLinkage() || !Direct || F->use_empty())
+    // A variadic function keeps its placeholders (its regions stay
+    // unknown): its calls pass more arguments than it has parameters, so the
+    // regions appended to a call would not land on the new parameters.
+    if (!F->hasLocalLinkage() || !Direct || F->use_empty() || F->isVarArg())
       continue;
     SmallVector<Type *, 8> Tys(F->getFunctionType()->params());
     Tys.append(2 * FS.size(), Type::getInt64Ty(C.getContext()));
